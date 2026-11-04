@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "description": "jsgit - exbe·jabe 공용 git 라이브러리 (isomorphic-git 서버 서비스 + HTTP 처리기 + 브라우저 클라이언트·UI 로직)",
+  "repository": { "type": "git", "url": "git+https://github.com/zaruous/jsgit.git" },
   "type": "module",
   "exports": {
     "./server": "./src/server/index.ts",
