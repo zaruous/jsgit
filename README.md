@@ -153,6 +153,27 @@ import type { GitStatus, GitProgress } from 'jsgit/types';
 | `maxShowBytes` | 5MB | `show` 가 돌려줄 파일 하나의 크기 상한. HEAD·index 쪽이 넘으면 413 `TOO_LARGE` |
 | `concurrency` | `{ local: 1, network: 1 }` | 작업 제한기의 줄별 동시 실행 수. **프로세스 전체에 적용된다**(마지막으로 만든 서비스의 값이 이긴다). 모듈 함수 `setWorkConcurrency()` 로도 바꾼다 |
 
+### 환경변수로 바꾸기 (배포본)
+
+배포된 exe 를 다시 빌드하지 않고 자원 상한을 바꾸려면 앱이 `gitOptionsFromEnv(appName)` 의 결과를 옵션에 펼친다. 접두는 `appName` 의 대문자다 (exbe → `EXBE_GIT_`).
+
+```ts
+import { createSingleRepoHandler, gitOptionsFromEnv } from 'jsgit/server';
+
+const env = gitOptionsFromEnv('exbe');
+for (const w of env.warnings) console.warn('[git]', w);
+const gitHandler = createSingleRepoHandler({ getRoot, appName: 'exbe', ...env.options }, { guard });
+```
+
+| 환경변수 | 단위 | 바꾸는 옵션 | 허용 범위 |
+|---|---|---|---|
+| `<NAME>_GIT_MAX_PACK_MB` | MB | `maxPackBytes` | 1 ~ 16384 |
+| `<NAME>_GIT_MAX_SHOW_MB` | MB | `maxShowBytes` | 1 ~ 1024 |
+| `<NAME>_GIT_CONCURRENCY_LOCAL` | 개 | `concurrency.local` | 1 ~ 16 |
+| `<NAME>_GIT_CONCURRENCY_NETWORK` | 개 | `concurrency.network` | 1 ~ 16 |
+
+잘못된 값(숫자 아님, 범위 밖)은 그 값만 무시하고 `warnings` 에 남긴다. 상한을 올리면 그만큼 메모리를 더 쓸 수 있다 (아래 보안·자원 대책).
+
 줄(lane)은 둘이다. `local` 은 객체·pack 을 읽는 모든 작업(status, log, show, changes, blame, merge, checkout, commit, stash 등), `network` 는 clone·fetch·pull·push. 자세한 이유는 아래 보안·자원 대책.
 
 `service.run(op, body, ctl?)` 의 `ctl.signal` 은 요청 연결이 끊기면 중단되는 `AbortSignal` 이다. HTTP 처리기가 알아서 넘긴다.
@@ -264,9 +285,17 @@ npx vitest run <파일>     # 하나만
 - 큰 파일을 만들지 않는다. 크기 관련 동작은 `maxPackBytes`, `maxShowBytes`, `concurrency` 같은 값을 줄여서 검증한다.
 - 코드 주석은 이 코드베이스의 평이한 한국어 문체를 따른다.
 
+### 버전과 배포
+
+- 버전은 `package.json` 의 `version` 과 `src/version.ts` 의 `JSGIT_VERSION` 을 같이 올린다 (`env.test.ts` 가 확인한다). 태그는 `v<버전>` (예: `v0.1.0`).
+- 앱은 쓸 jsgit 태그를 저장소 루트의 `jsgit.ref` 파일에 적는다. 앱의 배포 workflow 는 그 태그로 jsgit 을 앱 옆(`../jsgit`)에 받은 뒤 `npm ci` 를 한다.
+- 앱의 배포본(exe)에는 jsgit 이 번들로 들어가므로 사용하는 PC 에 jsgit·Node·npm 이 필요 없다. jsgit 을 고친 것을 사용자에게 내보내려면 앱을 다시 배포한다.
+- 배포본의 `/api/version` 과 `VERSION.txt` 에 jsgit 버전과 커밋이 나온다.
+- push 와 pull request 마다 `.github/workflows/test.yml` 이 타입 검사와 테스트를 돌린다.
+
 ### 공용 코드를 고치는 순서
 
 1. jsgit 에서 고치고 테스트·타입 검사를 통과시킨다. 앱 쪽에 같은 코드를 따로 고치지 않는다.
-2. jsgit 에 커밋(필요하면 태그)한다.
-3. exbe 와 jabe 에서 각각 업데이트해 확인한다. 로컬 개발은 `file:../jsgit` 라서 바로 반영된다. git 의존성을 쓰는 곳은 새 태그로 올린다.
+2. jsgit 에 커밋하고, 배포할 것이면 버전을 올려 태그(`v<버전>`)를 단다.
+3. exbe 와 jabe 에서 각각 확인한다. 로컬 개발은 `file:../jsgit` 라서 바로 반영된다. 배포할 때는 각 앱의 `jsgit.ref` 를 새 태그로 바꾼다.
 4. 공개 API(`createGitService`, `run`, 처리기, `src/server/index.ts` 의 내보내기)는 하위 호환을 지키고 추가만 한다.

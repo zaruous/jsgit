@@ -8,3 +8,4 @@ export {
 export * from './merge-logic.ts';
 export * from './blame-logic.ts';
 export type * from '../types.ts';
+export { JSGIT_VERSION } from '../version.ts';

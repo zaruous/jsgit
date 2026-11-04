@@ -9,7 +9,8 @@
     "./server": "./src/server/index.ts",
     "./client": "./src/client/index.ts",
     "./codemirror": "./src/codemirror/index.ts",
-    "./types": "./src/types.ts"
+    "./types": "./src/types.ts",
+    "./version": "./src/version.ts"
   },
   "files": ["src", "!src/**/*.test.ts", "!src/server/test-http-server.ts"],
   "scripts": {
