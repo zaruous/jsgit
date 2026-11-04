@@ -5,6 +5,7 @@ export {
   type GitHttpHandler, type GitHttpHandlerOptions, type GitRequestContext,
 } from './http.ts';
 export { ProgressHub } from './progress.ts';
+export { WorkLimiter, workLimiter, setWorkConcurrency, type Lane, type LimiterRunOptions } from './limiter.ts';
 export { GitError, scrub, cleanPath, assertRemoteUrl } from './util.ts';
 export { httpClient } from './http-client.ts';
 export type * from '../types.ts';

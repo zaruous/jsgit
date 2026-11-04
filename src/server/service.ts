@@ -10,6 +10,7 @@ import type {
 import { matchLines } from './diff.ts';
 import { repoFs, loadAttributes, needsEol, readEolConfig, toRepo, type EolContext } from './eol.ts';
 import { ProgressHub } from './progress.ts';
+import { setWorkConcurrency, workLimiter, type Lane } from './limiter.ts';
 import {
   GitError, assertRemoteUrl, cleanPath, cleanPaths, cleanRefName, cleanRev, originOf, scrub,
 } from './util.ts';
@@ -28,6 +29,15 @@ export interface GitServiceOptions {
   appName?: string;
   /** 테스트용: http://localhost, 127.0.0.1 원격 허용. 기본은 환경변수 <NAME>_GIT_ALLOW_LOCAL=1 */
   allowLocalHttp?: boolean;
+  /** pack 파일 하나의 크기 상한 바이트 (기본 1 GiB). 넘으면 메모리 부족으로 서버가 죽지 않도록 413 PACK_TOO_LARGE 로 거절한다 */
+  maxPackBytes?: number;
+  /** show 가 돌려줄 파일 하나의 크기 상한 바이트 (기본 5MB). HEAD·index 쪽이 넘으면 413 TOO_LARGE */
+  maxShowBytes?: number;
+  /**
+   * 프로세스 전체가 같이 쓰는 작업 제한기의 줄별 동시 실행 수 (기본 local 1, network 1).
+   * 서비스 하나가 아니라 프로세스 전체에 적용된다 (setWorkConcurrency 와 같다)
+   */
+  concurrency?: { local?: number; network?: number };
 }
 
 type Obj = Record<string, unknown>;
@@ -42,6 +52,7 @@ type Cb = Pick<Parameters<typeof git.fetch>[0], 'http' | 'onAuth' | 'onAuthFailu
 
 const LOG_CAP = 1000; // ahead/behind 계산 시 거슬러 올라가는 커밋 수 상한
 const MAX_SHOW = 5 * 1024 * 1024;
+const MAX_PACK = 1024 * 1024 * 1024;
 
 const str = (v: unknown, label: string): string => {
   if (typeof v !== 'string' || !v) throw new GitError(400, `${label} is required`);
@@ -61,13 +72,19 @@ export function createGitService(opts: GitServiceOptions) {
   const hub = opts.hub ?? new ProgressHub();
   const creds = opts.creds ?? new Map<string, { username: string; token: string }>();
   const locks = new Map<string, Promise<unknown>>();
-  let inflightStatus: Promise<GitStatus> | null = null;
+  // 저장소별 진행·대기 중인 status. 대기열에 넣기 전에 합친다
+  const inflightStatus = new Map<string, { p: Promise<unknown>; signals: Array<AbortSignal | undefined> }>();
+  const maxPack = opts.maxPackBytes ?? MAX_PACK;
+  const maxShow = opts.maxShowBytes ?? MAX_SHOW;
+  if (opts.concurrency) setWorkConcurrency(opts.concurrency);
+  // pack 디렉터리 수정 시각 → 가장 큰 pack (디렉터리 mtime 이 같으면 다시 훑지 않는다)
+  const packCache = new Map<string, { mtimeMs: number; max: number; name: string }>();
 
   const secrets = () => [...creds.values()].map((c) => c.token);
   const clean = (m: string) => scrub(m, secrets());
 
   // ---------- 저장소 찾기 ----------
-  async function findRepo(): Promise<Repo | null> {
+  function findDir(): string | null {
     const root = opts.getRoot();
     if (!root) return null;
     // isomorphic-git 의 findRoot 는 Windows 경로(역슬래시)에서 '.' 를 돌려줘 현재 작업 폴더를 건드릴 수 있으므로 직접 찾는다
@@ -79,6 +96,12 @@ export function createGitService(opts: GitServiceOptions) {
       if (up === dir) return null;
       dir = up;
     }
+    return dir;
+  }
+
+  async function findRepo(): Promise<Repo | null> {
+    const dir = findDir();
+    if (!dir) return null;
     // 캐시는 요청마다 새로 만든다 (같은 ms 안에 인덱스를 다시 쓰면 오래된 캐시를 믿을 수 있음)
     const r = withEol(dir);
     if (r.eol) await r.eol.preload?.();
@@ -116,6 +139,29 @@ export function createGitService(opts: GitServiceOptions) {
     const r = await findRepo();
     if (!r) throw new GitError(400, 'not a git repository', 'NOT_REPO');
     return r;
+  }
+
+  /** 읽을 pack 이 너무 크면 거절한다 (stat 만 본다). isomorphic-git 은 pack 전체를 메모리에 올린다 */
+  function guardPacks(dir: string): void {
+    const pd = path.join(dir, '.git', 'objects', 'pack');
+    let mtimeMs: number;
+    try { mtimeMs = fs.statSync(pd).mtimeMs; } catch { return; }
+    let c = packCache.get(pd);
+    if (!c || c.mtimeMs !== mtimeMs) {
+      c = { mtimeMs, max: 0, name: '' };
+      for (const n of fs.readdirSync(pd)) {
+        if (!n.endsWith('.pack')) continue;
+        try {
+          const size = fs.statSync(path.join(pd, n)).size;
+          if (size > c.max) { c.max = size; c.name = n; }
+        } catch { /* 사라진 파일은 무시 */ }
+      }
+      packCache.set(pd, c);
+    }
+    if (c.max > maxPack) {
+      const mb = (n: number) => Math.round(n / 1024 / 1024);
+      throw new GitError(413, `pack file is too large for this server (${c.name}, ${mb(c.max)}MB > limit ${mb(maxPack)}MB); use the system git CLI for this repository`, 'PACK_TOO_LARGE', { pack: c.name, bytes: c.max, limit: maxPack });
+    }
   }
 
   /** 같은 저장소에 대한 변경 작업을 한 번에 하나씩 */
@@ -455,11 +501,8 @@ export function createGitService(opts: GitServiceOptions) {
       if (!existing) await git.init({ fs, dir: root, defaultBranch: 'main' });
       return { ok: true };
     },
-    // 화면이 저장·포커스·F5 등으로 거의 동시에 여러 번 부르므로, 진행 중인 조회가 있으면 그 결과를 같이 쓴다
-    async status() {
-      inflightStatus ??= status().finally(() => { inflightStatus = null; });
-      return inflightStatus;
-    },
+    // 화면이 저장·포커스·F5 등으로 거의 동시에 여러 번 부르므로, 대기 중이거나 진행 중인 조회는 run() 에서 합친다
+    async status() { return status(); },
     async stage(b) {
       const r = await needRepo();
       for (const p of cleanPaths(b.paths)) {
@@ -518,6 +561,10 @@ export function createGitService(opts: GitServiceOptions) {
     },
     async show(b) {
       const r = await needRepo();
+      // 응답 JSON 에 큰 내용을 넣지 않는다 (isomorphic-git 은 크기만 따로 알려 주지 않아 읽은 뒤에 확인한다)
+      const tooLarge = (d: Uint8Array | null) => {
+        if (d && d.length > maxShow) throw new GitError(413, `file is too large to show (${d.length} bytes > ${maxShow})`, 'TOO_LARGE', { size: d.length, limit: maxShow });
+      };
       const p = cleanPath(b.path);
       const side = b.side;
       let data: Uint8Array | null = null;
@@ -526,8 +573,10 @@ export function createGitService(opts: GitServiceOptions) {
         let oid: string | null = null;
         try { oid = await resolveOid(r, ref); } catch (e) { if (b.ref !== undefined) throw e; }
         data = oid ? await readBlobAt(r, oid, p) : null;
+        tooLarge(data);
       } else if (side === 'index') {
         data = await indexBlob(r, p);
+        tooLarge(data);
       } else if (side === 'workdir') {
         const full = path.join(r.dir, p);
         try {
@@ -931,11 +980,17 @@ export function createGitService(opts: GitServiceOptions) {
   // ---------- 진입점 ----------
   const MUTATING = new Set(['stage', 'unstage', 'discard', 'init', 'identity-set', 'remote-set']);
 
-  async function run(op: string, body: Obj, ctl: RunControl = {}): Promise<unknown> {
-    const fn = Object.prototype.hasOwnProperty.call(ops, op) ? ops[op] : undefined;
-    if (!fn) throw new GitError(404, `unknown git operation: ${op}`);
-    if (ctl.signal?.aborted) throw new GitError(499, 'request aborted', 'ABORTED');
+  // 제한기를 거치지 않는 가벼운 작업 (pack·객체를 읽지 않는다)
+  const UNLIMITED = new Set(['auth', 'forget-auth', 'init', 'branches', 'remotes', 'remote-set', 'identity', 'identity-set']);
+  const NETWORK = new Set(['clone', 'fetch', 'pull', 'push']);
+  const laneOf = (op: string): Lane | null => (UNLIMITED.has(op) ? null : NETWORK.has(op) ? 'network' : 'local');
+
+  async function exec(op: string, fn: (b: Obj) => Promise<unknown>, body: Obj): Promise<unknown> {
     try {
+      if (op !== 'clone' && !UNLIMITED.has(op)) {
+        const dir = findDir();
+        if (dir) guardPacks(dir);
+      }
       if (MUTATING.has(op)) {
         const r = await findRepo();
         return await locked(r ? r.dir : '', () => fn(body));
@@ -948,6 +1003,40 @@ export function createGitService(opts: GitServiceOptions) {
       if (x.code === 'CheckoutConflictError') throw dirty(x.data?.filepaths ?? []);
       throw new GitError(500, clean(x.message ?? String(e)));
     }
+  }
+
+  /**
+   * 진입점. 객체·pack 을 읽는 작업은 프로세스 전체 제한기(limiter.ts)를 거쳐 줄별로 동시 실행 수를 제한한다.
+   * 주의: 제한기는 이 진입점에서만 건다. 작업(ops) 안에서 run() 을 다시 부르면 슬롯을 쥔 채 슬롯을 기다려 교착한다.
+   */
+  async function run(op: string, body: Obj, ctl: RunControl = {}): Promise<unknown> {
+    const fn = Object.prototype.hasOwnProperty.call(ops, op) ? ops[op] : undefined;
+    if (!fn) throw new GitError(404, `unknown git operation: ${op}`);
+    if (ctl.signal?.aborted) throw new GitError(499, 'request aborted', 'ABORTED');
+    const lane = laneOf(op);
+    if (!lane) return exec(op, fn, body);
+    const opId = optStr(body.opId);
+    const wait = opId ? {
+      onWait: (position: number) => hub.emit({ opId, phase: '대기 중', loaded: position }),
+      onStart: () => hub.emit({ opId, phase: '실행 중', loaded: 0 }),
+    } : {};
+    const enqueue = (skip: () => boolean) => workLimiter.run(lane, () => exec(op, fn, body), { skip, ...wait }).catch((e) => {
+      if (opId && e instanceof GitError && e.code === 'ABORTED') hub.emit({ opId, phase: 'error', loaded: 0, error: e.message });
+      throw e;
+    });
+    if (op === 'status') {
+      // 같은 저장소의 status 는 대기 중이든 실행 중이든 하나로 합친다. 합쳐진 요청이 모두 끊겨야 건너뛴다
+      const key = findDir() ?? '';
+      const cur = inflightStatus.get(key);
+      if (cur) { cur.signals.push(ctl.signal); return cur.p; }
+      const entry: { p: Promise<unknown>; signals: Array<AbortSignal | undefined> } = { p: Promise.resolve(), signals: [ctl.signal] };
+      entry.p = enqueue(() => entry.signals.every((s) => s?.aborted === true)).finally(() => {
+        if (inflightStatus.get(key) === entry) inflightStatus.delete(key);
+      });
+      inflightStatus.set(key, entry);
+      return entry.p;
+    }
+    return enqueue(() => ctl.signal?.aborted === true);
   }
 
   return { run, hub, creds };
