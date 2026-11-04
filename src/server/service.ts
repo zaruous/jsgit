@@ -99,9 +99,28 @@ export function createGitService(opts: GitServiceOptions) {
     return dir;
   }
 
+  /**
+   * 연결된 작업 트리(git worktree add)인가. 그 .git 은 'gitdir: <공통 저장소>/worktrees/<이름>' 을 가리키는 파일이고,
+   * 그 폴더에 commondir 이 있다. isomorphic-git 은 commondir 을 따르지 않아 HEAD 없음·모든 파일 '추가됨'·빈 기록으로 잘못 보이고,
+   * 쓰기 작업은 저장소를 망가뜨릴 수 있으므로 지원할 때까지 거절한다 (jsgit#1). 하위 모듈(.git 파일이지만 commondir 없음)은 그대로 쓴다
+   */
+  function linkedWorktree(dir: string): string | null {
+    const dotGit = path.join(dir, '.git');
+    try {
+      if (!fs.statSync(dotGit).isFile()) return null;
+      const m = /^gitdir:\s*(.+?)\s*$/m.exec(fs.readFileSync(dotGit, 'utf8'));
+      if (!m) return null;
+      const gitdir = path.resolve(dir, m[1]);
+      return fs.existsSync(path.join(gitdir, 'commondir')) ? gitdir : null;
+    } catch { return null; }
+  }
+  const unsupportedWorktree = (dir: string) =>
+    new GitError(409, `linked worktrees are not supported yet: ${norm(dir)} (open the main working tree instead)`, 'UNSUPPORTED_WORKTREE');
+
   async function findRepo(): Promise<Repo | null> {
     const dir = findDir();
     if (!dir) return null;
+    if (linkedWorktree(dir)) throw unsupportedWorktree(dir);
     // 캐시는 요청마다 새로 만든다 (같은 ms 안에 인덱스를 다시 쓰면 오래된 캐시를 믿을 수 있음)
     const r = withEol(dir);
     if (r.eol) await r.eol.preload?.();
@@ -271,6 +290,11 @@ export function createGitService(opts: GitServiceOptions) {
   }
 
   async function status(r0?: Repo | null): Promise<GitStatus> {
+    if (r0 === undefined) {
+      // 화면이 계속 부르는 조회이므로 오류 대신 '저장소 아님 + 이유' 로 답한다 (잘못된 상태를 보여 주지 않는다)
+      const dir = findDir();
+      if (dir && linkedWorktree(dir)) return { isRepo: false, repoRoot: norm(dir), branch: null, head: null, ahead: null, behind: null, merging: false, files: [], unsupported: 'worktree' };
+    }
     const r = r0 === undefined ? await findRepo() : r0;
     if (!r) return { isRepo: false, repoRoot: null, branch: null, head: null, ahead: null, behind: null, merging: false, files: [] };
     const head = await headOid(r);
