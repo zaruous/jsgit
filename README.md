@@ -64,16 +64,17 @@ peer 의존성: `@codemirror/state`, `@codemirror/view` 는 `jsgit/codemirror` �
 ```ts
 import { createSingleRepoHandler } from 'jsgit/server';
 
-const gitApi = createSingleRepoHandler(
+const gitHandler = createSingleRepoHandler(
   { getRoot: () => currentProjectRoot(), appName: 'exbe' },
-  { guard: (req) => (sameOrigin(req) ? null : 'cross-origin request denied') },
+  { guard: (req) => (sameOrigin(req) ? null : 'cross-origin request') },
 );
 
-// 앱의 http 서버 안에서: 처리했으면 true, 경로가 다르면 false
-if (await gitApi(req, res)) return;
+// 앱의 http 서버(또는 Connect 미들웨어) 안에서: 처리했으면 true, 경로가 다르면 false
+if (await gitHandler(req, res)) return;
+next();
 ```
 
-`gitApi.service` 로 서비스에 직접 접근할 수 있다 (`service.run(op, body)`).
+`gitHandler.service` 로 서비스에 직접 접근할 수 있다 (`service.run(op, body)`).
 
 ### jsgit/server: 프로젝트마다 저장소 (jabe 방식)
 
@@ -84,9 +85,8 @@ import { createPerProjectHandler } from 'jsgit/server';
 
 const gitHandler = createPerProjectHandler({ appName: 'jabe' }, { guard });
 
-registerRoute('/api/git/', async (req, res) => {
-  await gitHandler(req, res, { root: workspaceRoot });
-});
+// jabe 의 RouteContext 는 { root, url } 이다. 처리기는 처리했으면 true 를 돌려준다
+registerRoute({ prefix: '/api/git', handler: (req, res, ctx) => gitHandler(req, res, ctx) });
 ```
 
 `clone` 은 `project` 없이 워크스페이스 안의 절대 경로 `dir` 로 받고, 워크스페이스 밖이면 400 이다. `project` 는 워크스페이스 바로 아래 폴더 이름만 허용한다 (구분자·`..` 불가).
