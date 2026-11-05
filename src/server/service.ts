@@ -8,12 +8,12 @@ import type {
   GitRemote, GitStashEntry, GitStatus, GitTag, GitWorktree,
 } from '../types.ts';
 import { matchLines } from './diff.ts';
-import { repoFs, loadAttributes, needsEol, readEolConfig, toRepo, type EolContext } from './eol.ts';
-import { gitDirs, packDirs, worktreeEntries, worktreeHeads, type GitDirs } from './gitdir.ts';
+import { blobOid, repoFs, loadAttributes, needsEol, readEolConfig, toRepo, type EolContext } from './eol.ts';
+import { gitDirs, packDirs, pruneReason, worktreeEntries, worktreeHeads, type GitDirs } from './gitdir.ts';
 import { ProgressHub } from './progress.ts';
 import { setWorkConcurrency, workLimiter, type Lane } from './limiter.ts';
 import {
-  GitError, assertRemoteUrl, cleanPath, cleanPaths, cleanRefName, cleanRev, isInside, originOf, scrub,
+  GitError, assertRemoteUrl, cleanPath, cleanPaths, cleanRefName, cleanRev, isInside, originOf, realPathish, scrub,
 } from './util.ts';
 
 export interface GitServiceOptions {
@@ -368,6 +368,34 @@ export function createGitService(opts: GitServiceOptions) {
       if (h === 1 && w === 1 && s === 1) continue;
       if (h === 0 && s === 0) continue; // 미추적
       out.push(p);
+    }
+    return out;
+  }
+
+  /**
+   * isomorphic-git 은 stat 을 초 단위로 비교하므로, index 를 쓴 그 초 안에 크기가 같게 바뀐 파일을 그대로라고 본다 (racy git).
+   * git 처럼 index 와 같거나 늦은 초에 바뀐 파일은 내용(blob oid)으로 다시 비교한다. worktree-remove 가 바뀐 파일을 지우지 않게
+   */
+  async function racyModified(r: Repo, unchanged: string[]): Promise<string[]> {
+    let idxSec: number;
+    try { idxSec = Math.floor(fs.statSync(path.join(r.gitdir, 'index')).mtimeMs / 1000); } catch { return []; }
+    const sec = (p: string) => { try { return Math.floor(fs.lstatSync(path.join(r.dir, p)).mtimeMs / 1000); } catch { return -1; } };
+    const suspects = new Set(unchanged.filter((p) => sec(p) >= idxSec));
+    if (!suspects.size) return [];
+    const oids = new Map<string, string>();
+    await git.walk({
+      fs: r.fs, dir: r.dir, cache: r.cache, trees: [git.STAGE()],
+      map: async (p, [e]) => { if (e && suspects.has(p)) oids.set(p, (await e.oid()) as string); return true; },
+    });
+    const out: string[] = [];
+    for (const p of suspects) {
+      const full = path.join(r.dir, p);
+      try {
+        if (!fs.lstatSync(full).isFile()) continue;
+        let buf: Uint8Array = fs.readFileSync(full);
+        if (r.eol) buf = await toRepo(r.eol, p, buf);
+        if (blobOid(buf) !== oids.get(p)) out.push(p);
+      } catch { out.push(p); }
     }
     return out;
   }
@@ -1042,6 +1070,68 @@ export function createGitService(opts: GitServiceOptions) {
           throw e;
         }
         return worktreeList(r);
+      });
+    },
+    async 'worktree-remove'(b) {
+      const r = await needRepo();
+      if (typeof b.path !== 'string' || !b.path || b.path.includes('\0') || !path.isAbsolute(b.path)) throw new GitError(400, 'path must be an absolute path');
+      const target = path.resolve(b.path);
+      const force = b.force === true;
+      return locked(r.commondir, async () => {
+        const found = worktreeEntries(r.commondir).filter((e) => e.dir && samePath(e.dir, target));
+        if (!found.length) throw new GitError(404, `not a registered worktree: ${norm(target)}`);
+        const mismatch = (why: string) => new GitError(409, `refusing to delete ${norm(target)}: ${why}`, 'WORKTREE_MISMATCH', { worktree: norm(target) });
+        // 둘 이상이 같은 폴더를 가리키면(gitdir 파일이 바뀐 경우 등) 어느 것도 지우지 않는다
+        if (found.length > 1) throw mismatch('more than one worktree entry points to this folder');
+        const w = found[0];
+        if (w.name === null) throw new GitError(400, 'cannot remove the main worktree');
+        if (samePath(w.gitdir, r.gitdir)) throw new GitError(400, 'cannot remove the current worktree');
+        if (w.locked !== null) throw new GitError(409, `worktree is locked${w.locked ? ': ' + w.locked : ''}`, 'WORKTREE_LOCKED', { worktree: norm(target), ...(w.locked ? { reason: w.locked } : {}) });
+        const dir = w.dir!;
+        if (fs.existsSync(dir)) {
+          // 지우는 것은 worktrees/<이름>/gitdir 이 가리키는 폴더뿐이고, 그 폴더의 .git 파일이 이 worktrees/<이름> 을 되가리켜야 한다
+          const d = gitDirs(dir);
+          const sameReal = (a: string, b2: string) => path.relative(realPathish(a), realPathish(b2)) === '';
+          if (!d || !sameReal(d.gitdir, w.gitdir)) throw mismatch('its .git does not point back to ' + norm(w.gitdir));
+          const mainDir = path.dirname(r.commondir);
+          for (const keep of [r.commondir, mainDir, r.dir]) {
+            if (sameReal(dir, keep) || isInside(dir, keep)) throw mismatch('it contains ' + norm(keep));
+          }
+          if (path.dirname(dir) === dir) throw mismatch('it is a filesystem root');
+          if (!force) {
+            // git 처럼 바뀐·올린·미추적 파일이 있으면 거절 (무시된 파일은 괜찮다)
+            const wr = withEol(dir);
+            await wr.eol?.preload?.();
+            const rows = await matrix(wr);
+            const same = (x: Row) => x[1] === 1 && x[2] === 1 && x[3] === 1;
+            const changed = rows.filter((x) => !same(x)).map((x) => x[0]);
+            changed.push(...await racyModified(wr, rows.filter(same).map((x) => x[0])));
+            if (mergeHead(wr)) changed.push(...readConflicts(wr));
+            if (changed.length) throw dirty([...new Set(changed)], 'worktree contains modified or untracked files (use force to delete anyway)');
+          }
+          // 링크(심볼릭·junction)는 따라가지 않고 링크만 지운다 (fs.rm 은 lstat 기준)
+          fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3 });
+        }
+        fs.rmSync(w.gitdir, { recursive: true, force: true, maxRetries: 3 });
+        return worktreeList(r);
+      });
+    },
+    async 'worktree-prune'() {
+      const r = await needRepo();
+      return locked(r.commondir, async () => {
+        const root = path.join(r.commondir, 'worktrees');
+        const pruned: string[] = [];
+        let names: string[] = [];
+        try { names = fs.readdirSync(root).sort(); } catch { /* 없음 */ }
+        for (const n of names) {
+          const admin = path.join(root, n);
+          if (samePath(admin, r.gitdir) || pruneReason(admin) === null) continue;
+          // 관리 폴더(worktrees/<이름>)만 지운다. 작업 폴더는 건드리지 않는다
+          fs.rmSync(admin, { recursive: true, force: true, maxRetries: 3 });
+          pruned.push(n);
+        }
+        try { fs.rmdirSync(root); } catch { /* 비어 있지 않음 */ }
+        return { pruned, worktrees: await worktreeList(r) };
       });
     },
     async blame(b) {

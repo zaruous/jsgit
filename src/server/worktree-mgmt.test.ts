@@ -226,3 +226,165 @@ describe.skipIf(!hasGit)('작업 트리 관리: list / add (jsgit#4)', () => {
     fsckOk(main);
   });
 });
+
+/** 폴더 안 파일 목록 (상대 경로, / 구분, 정렬) */
+const filesIn = (dir: string) => (fs.readdirSync(dir, { recursive: true }) as string[]).map((n) => n.split(path.sep).join('/')).sort();
+
+describe.skipIf(!hasGit)('작업 트리 관리: remove / prune (jsgit#4)', () => {
+  it('remove: 깨끗한 작업 트리는 폴더와 worktrees/<이름> 을 지운다 (git worktree list·fsck 정상, 브랜치는 남는다)', async () => {
+    const { base, main } = setup();
+    const run = svcAt(main);
+    const mine = path.join(base, 'mine');
+    await run('worktree-add', { path: mine, branch: 'topic', create: true });
+    const byGit = path.join(base, 'by-git');
+    g(main, 'worktree', 'add', '-q', byGit, 'spare');
+    for (const [wt, name] of [[mine, 'mine'], [byGit, 'by-git']] as const) {
+      const list = await run<GitWorktree[]>('worktree-remove', { path: wt });
+      expect(fs.existsSync(wt)).toBe(false);
+      expect(fs.existsSync(path.join(main, '.git', 'worktrees', name))).toBe(false);
+      expect(jsList(list)).toEqual(gitList(main));
+    }
+    expect(gitList(main).map((r) => r.path)).toEqual([real(main)]);
+    expect(g(main, 'branch', '--list', 'topic', 'spare').split('\n').map((l) => l.trim()).filter(Boolean)).toEqual(['spare', 'topic']);
+    expect(gitPorcelain(main)).toEqual([]);
+    fsckOk(main);
+    // 지운 작업 트리의 브랜치는 다시 꺼낼 수 있다
+    expect(gitFails(main, 'worktree', 'add', '-q', path.join(base, 'again'), 'topic')).toBe(false);
+  });
+
+  it('remove: 바뀐·올린·미추적 파일이 있으면 409 DIRTY (그대로 둔다), force 면 지운다', async () => {
+    const { base, main } = setup();
+    const run = svcAt(main);
+    const wt = path.join(base, 'wt');
+    await run('worktree-add', { path: wt, branch: 'topic', create: true });
+    const cases: Array<[string, () => void, () => void]> = [
+      // 'changed\n' 은 원래 내용 'one\ntwo\n' 와 크기가 같다: index 를 쓴 그 초 안에 바뀌면 stat 만으로는 모른다 (racy git)
+      ['modified', () => write(wt, 'a.txt', 'changed\n'), () => { g(wt, 'checkout', '--', 'a.txt'); }],
+      ['untracked', () => write(wt, 'new.txt', 'n\n'), () => fs.rmSync(path.join(wt, 'new.txt'))],
+      ['staged', () => { write(wt, 's.txt', 's\n'); g(wt, 'add', 's.txt'); }, () => { g(wt, 'rm', '-q', '--cached', 's.txt'); fs.rmSync(path.join(wt, 's.txt')); }],
+    ];
+    for (const [label, makeDirty, undo] of cases) {
+      makeDirty();
+      const e = await fail(run('worktree-remove', { path: wt }));
+      expect([label, e.status, e.code]).toEqual([label, 409, 'DIRTY']);
+      expect((e.extra.files as string[]).length).toBeGreaterThan(0);
+      expect(gitFails(main, 'worktree', 'remove', wt)).toBe(true); // git.exe 도 거절
+      expect(fs.existsSync(path.join(wt, 'a.txt'))).toBe(true);
+      expect(gitList(main)).toHaveLength(2);
+      undo();
+      expect(gitPorcelain(wt)).toEqual([]);
+    }
+    write(wt, 'a.txt', 'changed\n');
+    write(wt, 'new.txt', 'n\n');
+    await run('worktree-remove', { path: wt, force: true });
+    expect(fs.existsSync(wt)).toBe(false);
+    expect(gitList(main).map((r) => r.path)).toEqual([real(main)]);
+    fsckOk(main);
+  });
+
+  it('remove 거절: 잠긴 작업 트리(force 여도), 주 작업 트리, 지금 열린 작업 트리, 등록되지 않은 경로', async () => {
+    const { base, main } = setup();
+    const run = svcAt(main);
+    const wt = path.join(base, 'wt');
+    await run('worktree-add', { path: wt, branch: 'topic', create: true });
+    g(main, 'worktree', 'lock', '--reason', 'keep me', wt);
+    expect((await run<GitWorktree[]>('worktree-list'))[1]).toMatchObject({ locked: true, lockReason: 'keep me' });
+    for (const force of [false, true]) {
+      const e = await fail(run('worktree-remove', { path: wt, force }));
+      expect([e.status, e.code]).toEqual([409, 'WORKTREE_LOCKED']);
+    }
+    expect(fs.existsSync(path.join(wt, 'a.txt'))).toBe(true);
+    g(main, 'worktree', 'unlock', wt);
+    expect((await fail(run('worktree-remove', { path: main }))).status).toBe(400);
+    expect((await fail(svcAt(wt)('worktree-remove', { path: wt }))).status).toBe(400);
+    expect((await fail(run('worktree-remove', { path: path.join(base, 'nope') }))).status).toBe(404);
+    expect((await fail(run('worktree-remove', { path: 'wt' }))).status).toBe(400);
+    expect(fs.existsSync(path.join(main, 'a.txt'))).toBe(true);
+    expect(fs.existsSync(path.join(wt, 'a.txt'))).toBe(true);
+    // 연결된 작업 트리에서 다른 작업 트리를 지울 수 있다
+    const wt2 = path.join(base, 'wt2');
+    await run('worktree-add', { path: wt2, branch: 'spare' });
+    await svcAt(wt)('worktree-remove', { path: wt2 });
+    expect(fs.existsSync(wt2)).toBe(false);
+    expect(gitList(main).map((r) => r.path)).toEqual([real(main), real(wt)]);
+  });
+
+  it('remove 안전: worktrees/<이름>/gitdir 이 다른 폴더를 가리키게 바뀌어도 그 폴더를 지우지 않는다', async () => {
+    const { base, main } = setup();
+    const run = svcAt(main);
+    const wt = path.join(base, 'wt');
+    const other = path.join(base, 'other');
+    await run('worktree-add', { path: wt, branch: 'topic', create: true });
+    await run('worktree-add', { path: other, branch: 'spare' });
+    const admin = path.join(main, '.git', 'worktrees', 'wt');
+    const gitdirFile = path.join(admin, 'gitdir');
+    const original = fs.readFileSync(gitdirFile, 'utf8');
+    const victim = path.join(base, 'victim');
+    write(victim, 'precious.txt', 'keep\n');
+    const snapshot = () => [filesIn(victim), filesIn(main), filesIn(wt), filesIn(other)];
+    const before = snapshot();
+    // 1) .git 이 없는 폴더, 2) 주 작업 트리, 3) 다른 작업 트리(.git 이 다른 worktrees/<이름> 을 가리킴), 4) 모든 것을 담은 상위 폴더
+    for (const target of [victim, main, other, base]) {
+      fs.writeFileSync(gitdirFile, path.join(target, '.git').replace(/\\/g, '/') + '\n');
+      for (const force of [false, true]) {
+        const e = await fail(run('worktree-remove', { path: target, force }));
+        expect([target, force, e.status >= 400 && e.status < 500]).toEqual([target, force, true]);
+        if (target !== main) expect([target, e.code]).toEqual([target, 'WORKTREE_MISMATCH']);
+      }
+      expect(snapshot()).toEqual(before);
+      expect(fs.existsSync(admin)).toBe(true);
+    }
+    fs.writeFileSync(gitdirFile, original);
+    // 작업 트리 안의 연결(junction/심볼릭 링크)은 따라가지 않는다
+    const outside = path.join(base, 'outside');
+    write(outside, 'keep.txt', 'k\n');
+    fs.symlinkSync(outside, path.join(wt, 'link'), 'junction');
+    await run('worktree-remove', { path: wt, force: true });
+    expect(fs.existsSync(wt)).toBe(false);
+    expect(fs.readFileSync(path.join(outside, 'keep.txt'), 'utf8')).toBe('k\n');
+    expect(filesIn(victim)).toEqual(['precious.txt']);
+    expect(gitList(main).map((r) => r.path)).toEqual([real(main), real(other)]);
+    fsckOk(main);
+  });
+
+  it('prune: 작업 폴더가 사라진 항목만 정리 (잠긴 것·살아 있는 것은 그대로), 작업 폴더 파일은 건드리지 않는다', async () => {
+    const { base, main } = setup();
+    const run = svcAt(main);
+    const live = path.join(base, 'live');
+    const gone = path.join(base, 'gone');
+    const goneLocked = path.join(base, 'gone-locked');
+    const noDotGit = path.join(base, 'no-dotgit');
+    await run('worktree-add', { path: live, branch: 'spare' });
+    await run('worktree-add', { path: gone, branch: 'g1', create: true });
+    g(main, 'worktree', 'add', '-q', '-b', 'g2', goneLocked);
+    g(main, 'worktree', 'lock', goneLocked);
+    await run('worktree-add', { path: noDotGit, branch: 'g3', create: true });
+    fs.rmSync(gone, { recursive: true, force: true });
+    fs.rmSync(goneLocked, { recursive: true, force: true });
+    fs.rmSync(path.join(noDotGit, '.git'));
+    // 관리 폴더가 망가진 항목 (git 도 prune 으로 지운다): 파일, gitdir 파일 없음
+    const wtRoot = path.join(main, '.git', 'worktrees');
+    fs.writeFileSync(path.join(wtRoot, 'junk'), 'x');
+    fs.mkdirSync(path.join(wtRoot, 'no-gitdir'));
+    fs.writeFileSync(path.join(wtRoot, 'no-gitdir', 'HEAD'), 'ref: refs/heads/main\n');
+
+    const list = await run<GitWorktree[]>('worktree-list');
+    expect(jsList(list)).toEqual(gitList(main));
+    expect(list.filter((w) => w.prunable).map((w) => w.name).sort()).toEqual(['gone', 'no-dotgit']);
+    expect(list.find((w) => w.name === 'gone-locked')).toMatchObject({ locked: true, prunable: false });
+
+    const res = await run<{ pruned: string[]; worktrees: GitWorktree[] }>('worktree-prune');
+    expect(res.pruned).toEqual(['gone', 'junk', 'no-dotgit', 'no-gitdir']);
+    expect(jsList(res.worktrees)).toEqual(gitList(main));
+    expect(fs.readdirSync(wtRoot).sort()).toEqual(['gone-locked', 'live']);
+    // git.exe 의 prune 이 더 지울 것이 없다
+    expect(g(main, 'worktree', 'prune', '--dry-run', '--verbose').trim()).toBe('');
+    expect(gitList(main).map((r) => [r.path, r.prunable])).toEqual([[real(main), false], [real(goneLocked), false], [real(live), false]]);
+    // .git 만 지운 작업 폴더의 파일은 남아 있다
+    expect(filesIn(noDotGit)).toEqual(['a.txt', 'dir', 'dir/b.txt']);
+    expect(gitPorcelain(live)).toEqual([]);
+    fsckOk(main);
+    // 다시 해도 지울 것이 없다
+    expect((await run<{ pruned: string[] }>('worktree-prune')).pruned).toEqual([]);
+  });
+});
