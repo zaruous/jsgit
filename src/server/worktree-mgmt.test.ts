@@ -6,9 +6,13 @@ import { afterAll, describe, expect, it } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import http from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { execFileSync } from 'node:child_process';
 import { createGitService, type GitServiceOptions } from './service.ts';
+import { createPerProjectHandler } from './http.ts';
 import { GitError } from './util.ts';
+import { createGitApi, GitError as ClientGitError } from '../client/api.ts';
 import type { GitStatus, GitWorktree } from '../types.ts';
 
 process.env.GIT_CONFIG_NOSYSTEM = '1';
@@ -386,5 +390,66 @@ describe.skipIf(!hasGit)('작업 트리 관리: remove / prune (jsgit#4)', () =>
     fsckOk(main);
     // 다시 해도 지울 것이 없다
     expect((await run<{ pruned: string[] }>('worktree-prune')).pruned).toEqual([]);
+  });
+});
+
+describe.skipIf(!hasGit)('작업 트리 관리: HTTP·클라이언트 API (jsgit#4)', () => {
+  it('프로젝트별 처리기: worktree-add/remove 경로는 워크스페이스 안만, 만든 작업 트리는 새 프로젝트로 열린다', async () => {
+    const ws = tmp();
+    const p1 = path.join(ws, 'p1');
+    fs.mkdirSync(p1);
+    g(p1, 'init', '-q', '-b', 'main');
+    write(p1, 'a.txt', 'a\n');
+    g(p1, 'add', '.');
+    g(p1, 'commit', '-q', '-m', 'first');
+    const handler = createPerProjectHandler();
+    const server = http.createServer((req, res) => {
+      const url = new URL(req.url || '/', 'http://localhost');
+      void handler(req, res, { root: ws, url });
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}/api/git/`;
+    try {
+      const outside = path.join(path.dirname(ws), path.basename(ws) + '-out');
+      tmpRoots.push(outside);
+      const ff: typeof fetch = (u, init) => fetch(u, init);
+      const api = createGitApi({ base, fetch: ff, extraBody: () => ({ project: 'p1' }) });
+      for (const p of [outside, path.join(ws, '..', path.basename(ws) + '-out2'), ws]) {
+        const e = await api.addWorktree({ path: p, branch: 'x', create: true }).catch((x: ClientGitError) => x);
+        expect(e).toBeInstanceOf(ClientGitError);
+      }
+      expect(fs.existsSync(outside)).toBe(false);
+      expect(g(p1, 'branch', '--list', 'x').trim()).toBe('');
+      const list = await api.addWorktree({ path: path.join(ws, 'p1-topic'), branch: 'topic', create: true });
+      expect(list.map((w) => [w.name, w.branch, w.current])).toEqual([[null, 'main', true], ['p1-topic', 'topic', false]]);
+      expect(jsList(list)).toEqual(gitList(p1));
+      // 새 작업 트리는 워크스페이스의 프로젝트 하나가 된다
+      const api2 = createGitApi({ base, fetch: ff, extraBody: () => ({ project: 'p1-topic' }) });
+      expect(await api2.status()).toMatchObject({ isRepo: true, branch: 'topic', files: [] });
+      expect((await api2.listWorktrees()).filter((w) => w.current).map((w) => w.name)).toEqual(['p1-topic']);
+      // 이미 다른 작업 트리가 꺼낸 브랜치
+      const e = await api.addWorktree({ path: path.join(ws, 'p1-main'), branch: 'main' }).catch((x: ClientGitError) => x);
+      expect([e instanceof ClientGitError, (e as ClientGitError).code]).toEqual([true, 'BRANCH_IN_WORKTREE']);
+      // 워크스페이스 밖 경로로 remove 는 거절 (git.exe 로 밖에 만든 작업 트리)
+      const ext = path.join(outside, 'ext');
+      g(p1, 'worktree', 'add', '-q', '-b', 'ext', ext);
+      expect(await api.removeWorktree({ path: ext, force: true }).catch((x: ClientGitError) => x)).toBeInstanceOf(ClientGitError);
+      expect(fs.existsSync(path.join(ext, 'a.txt'))).toBe(true);
+      // 변경이 있으면 DIRTY, force 로 지운다
+      write(path.join(ws, 'p1-topic'), 'a.txt', 'changed!\n');
+      const d = await api.removeWorktree({ path: path.join(ws, 'p1-topic') }).catch((x: ClientGitError) => x);
+      expect((d as ClientGitError).code).toBe('DIRTY');
+      const after = await api.removeWorktree({ path: path.join(ws, 'p1-topic'), force: true });
+      expect(after.map((w) => w.name)).toEqual([null, 'ext']);
+      fs.rmSync(outside, { recursive: true, force: true });
+      const pr = await api.pruneWorktrees();
+      expect(pr.pruned).toEqual(['ext']);
+      expect(pr.worktrees.map((w) => w.name)).toEqual([null]);
+      expect(gitList(p1).map((r) => r.path)).toEqual([real(p1)]);
+      fsckOk(p1);
+    } finally {
+      server.closeAllConnections();
+      await new Promise((r) => server.close(r));
+    }
   });
 });

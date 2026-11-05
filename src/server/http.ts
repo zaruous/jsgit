@@ -123,6 +123,13 @@ export function projectDir(root: string, project: unknown): string {
   return dir;
 }
 
+/** 워크스페이스 안쪽(워크스페이스 자신은 아님)의 경로만 허용 */
+function insideWorkspace(root: string, p: unknown, label: string): void {
+  const d = typeof p === 'string' && p && !p.includes('\0') ? path.resolve(p) : '';
+  const rel = path.relative(path.resolve(root), d);
+  if (!d || !rel || rel.startsWith('..') || path.isAbsolute(rel)) throw new GitError(400, `${label} must be inside the workspace`);
+}
+
 /** project 없이 쓰는 작업 */
 const NO_PROJECT_OPS = new Set(['clone', 'auth', 'forget-auth']);
 
@@ -145,13 +152,11 @@ export function createPerProjectHandler(svcOpts: Omit<GitServiceOptions, 'getRoo
     serviceFor: (op, b, ctx) => {
       if (!ctx.root) throw new GitError(500, 'workspace root is not set');
       if (NO_PROJECT_OPS.has(op)) {
-        if (op === 'clone') {
-          const d = typeof b.dir === 'string' ? path.resolve(b.dir) : '';
-          const rel = path.relative(path.resolve(ctx.root), d);
-          if (!d || !rel || rel.startsWith('..') || path.isAbsolute(rel)) throw new GitError(400, 'dir must be inside the workspace');
-        }
+        if (op === 'clone') insideWorkspace(ctx.root, b.dir, 'dir');
         return serviceFor(ctx.root);
       }
+      // 작업 트리를 만들고 지우는 경로도 clone 과 같은 기준으로 워크스페이스 안만 (jsgit#4)
+      if (op === 'worktree-add' || op === 'worktree-remove') insideWorkspace(ctx.root, b.path, 'path');
       return serviceFor(projectDir(ctx.root, b.project));
     },
   });

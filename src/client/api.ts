@@ -4,7 +4,7 @@
  */
 import type {
   GitBlameRange, GitBranches, GitChangedFile, GitCommitInfo, GitMergeResult, GitProgress,
-  GitRemote, GitStashEntry, GitStatus, GitTag,
+  GitRemote, GitStashEntry, GitStatus, GitTag, GitWorktree,
 } from '../types.ts';
 
 export class GitAuthRequired extends Error {
@@ -102,6 +102,22 @@ export function createGitApi(opts: GitApiOptions = {}) {
     deleteTag: (a: { name: string }) => call<GitTag[]>('tag-delete', a),
     /** 줄별 작성자 (작업 폴더가 아니라 ref 기준, 기본 HEAD). 기록이 길면 maxCommits 까지만 거슬러 올라간다 */
     blame: (a: { path: string; ref?: string; maxCommits?: number }) => call<GitBlameRange[]>('blame', a),
+
+    // ---- 작업 트리 (jsgit#4) ----
+    /** 작업 트리 목록 (주 작업 트리가 먼저). 경로·HEAD·브랜치·잠김·prunable */
+    listWorktrees: () => call<GitWorktree[]>('worktree-list'),
+    /**
+     * 작업 트리 추가: path 는 절대 경로(없거나 빈 폴더, 허용 위치 안). create 면 branch 를 startPoint(기본 HEAD)에서 새로 만든다.
+     * 다른 작업 트리가 꺼낸 브랜치는 409 { code: 'BRANCH_IN_WORKTREE' }, 이미 등록된 경로는 409 { code: 'WORKTREE_EXISTS' }
+     */
+    addWorktree: (a: { path: string; branch: string; create?: boolean; startPoint?: string }) => call<GitWorktree[]>('worktree-add', a),
+    /**
+     * 작업 트리 삭제 (작업 폴더와 .git/worktrees/<이름>). 바뀐·미추적 파일이 있으면 409 { code: 'DIRTY' } (force 로 무시),
+     * 잠겼으면 409 { code: 'WORKTREE_LOCKED' }, 폴더가 그 항목을 되가리키지 않으면 409 { code: 'WORKTREE_MISMATCH' }
+     */
+    removeWorktree: (a: { path: string; force?: boolean }) => call<GitWorktree[]>('worktree-remove', a),
+    /** 작업 폴더가 사라진 항목 정리 (잠긴 것 제외). pruned: 지운 worktrees/<이름> */
+    pruneWorktrees: () => call<{ pruned: string[]; worktrees: GitWorktree[] }>('worktree-prune'),
 
     /** 진행률 구독 (SSE). 해제 함수를 돌려준다 */
     watchProgress(opId: string, onProgress: (p: GitProgress) => void): () => void {

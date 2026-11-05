@@ -89,7 +89,7 @@ const gitHandler = createPerProjectHandler({ appName: 'jabe' }, { guard });
 registerRoute({ prefix: '/api/git', handler: (req, res, ctx) => gitHandler(req, res, ctx) });
 ```
 
-`clone` 은 `project` 없이 워크스페이스 안의 절대 경로 `dir` 로 받고, 워크스페이스 밖이면 400 이다. `project` 는 워크스페이스 바로 아래 폴더 이름만 허용한다 (구분자·`..` 불가).
+`clone` 은 `project` 없이 워크스페이스 안의 절대 경로 `dir` 로 받고, 워크스페이스 밖이면 400 이다. `worktree-add`·`worktree-remove` 의 `path` 도 같은 기준으로 워크스페이스 안만 허용한다. `project` 는 워크스페이스 바로 아래 폴더 이름만 허용한다 (구분자·`..` 불가). 워크스페이스 바로 아래에 만든 작업 트리는 그 폴더 이름으로 새 프로젝트가 된다.
 
 ### jsgit/client
 
@@ -152,6 +152,7 @@ import type { GitStatus, GitProgress } from 'jsgit/types';
 | `maxPackBytes` | 1 GiB | pack 파일 하나의 크기 상한. 넘으면 413 `PACK_TOO_LARGE` |
 | `maxShowBytes` | 5MB | `show` 가 돌려줄 파일 하나의 크기 상한. HEAD·index 쪽이 넘으면 413 `TOO_LARGE` |
 | `concurrency` | `{ local: 1, network: 1 }` | 작업 제한기의 줄별 동시 실행 수. **프로세스 전체에 적용된다**(마지막으로 만든 서비스의 값이 이긴다). 모듈 함수 `setWorkConcurrency()` 로도 바꾼다 |
+| `worktreeRoots` | 주 작업 트리의 부모 폴더 | `worktree-add` 가 새 작업 폴더를 만들 수 있는 폴더들을 돌려주는 함수. 그 안쪽만 허용한다 (심볼릭 링크·8.3 이름은 풀어서 비교) |
 
 ### 환경변수로 바꾸기 (배포본)
 
@@ -196,6 +197,7 @@ const gitHandler = createSingleRepoHandler({ getRoot, appName: 'exbe', ...env.op
 | 기록·병합 | `log`, `changes`, `merge`, `merge-abort`, `resolve` |
 | 스태시 | `stash-list`, `stash-push`, `stash-apply`, `stash-drop` |
 | 태그 | `tags`, `tag-create`, `tag-delete` |
+| 작업 트리 | `worktree-list`, `worktree-add`, `worktree-remove`, `worktree-prune` |
 | 기타 | `blame` |
 
 **진행률 이벤트** `{ opId, phase, loaded, total?, done?, error? }`: 원격 작업이 isomorphic-git 의 진행 단계(phase)를 그대로 전달하고, 끝나면 `done: true`, 실패하면 `error`. 작업 제한기가 대기시키는 동안에는 `phase: '대기 중'`(`loaded` = 대기 순번), 시작하면 `phase: '실행 중'` 이 온다.
@@ -205,23 +207,50 @@ const gitHandler = createSingleRepoHandler({ getRoot, appName: 'exbe', ...env.op
 | 상태 | code | 의미 / 추가 필드 |
 |---|---|---|
 | 409 | `AUTH_REQUIRED` | 원격 인증 필요. `url`. 클라이언트는 `GitAuthRequired` 를 던진다 |
-| 409 | `DIRTY` | 작업 폴더 변경 때문에 전환·병합 불가, 또는 병합 진행 중. `files` |
+| 409 | `DIRTY` | 작업 폴더 변경 때문에 전환·병합 불가, 또는 병합 진행 중. `worktree-remove` 대상에 바뀐·올린·미추적 파일이 있음(`force: true` 로 무시). `files` |
 | 400 | `MARKERS` | 충돌 표시(`<<<<<<<`)가 남은 파일을 해결 처리하려 함. `paths` (`force: true` 로 무시) |
 | 400 | `CONFLICTS` | 해결 안 된 충돌이 남은 채 커밋하려 함. `paths` |
 | 400 | `NO_IDENTITY` | `user.name`/`user.email` 이 없음 |
 | 400 | `NO_PROJECT` | 열린 프로젝트가 없거나 `project` 가 잘못됨 |
 | 400 | `NOT_REPO` | git 저장소가 아님 |
-| 409 | `BRANCH_IN_WORKTREE` | 다른 작업 트리(주 작업 트리 포함)가 꺼내 둔 브랜치를 `checkout` 하거나 `branch-delete` 하려 함 (git 과 같은 규칙). `branch`, `worktree` |
+| 409 | `BRANCH_IN_WORKTREE` | 다른 작업 트리(주 작업 트리 포함)가 꺼내 둔 브랜치를 `checkout` 하거나 `branch-delete` 하려 함, 또는 어느 작업 트리든 꺼내 둔 브랜치로 `worktree-add` 하려 함 (git 과 같은 규칙). `branch`, `worktree` |
+| 409 | `WORKTREE_EXISTS` | `worktree-add` 경로가 이미 등록된 작업 트리(폴더가 지워진 것 포함)다. `worktree-prune`·`worktree-remove` 로 정리한다. `worktree` |
+| 409 | `WORKTREE_LOCKED` | 잠긴 작업 트리를 `worktree-remove` 하려 함 (`force` 여도). `worktree`, `reason?` |
+| 409 | `WORKTREE_MISMATCH` | `worktree-remove` 가 지울 폴더의 `.git` 이 그 항목(`worktrees/<이름>`)을 되가리키지 않음, 주 작업 트리·공통 폴더·열린 프로젝트를 담음, 여러 항목이 같은 폴더를 가리킴. 아무것도 지우지 않는다. `worktree` |
 | 413 | `TOO_LARGE` | `show` 대상이 `maxShowBytes` 초과. `size`, `limit` |
 | 413 | `PACK_TOO_LARGE` | pack 이 `maxPackBytes` 초과. `pack`, `bytes`, `limit` |
 | 499 | `ABORTED` | 요청 연결이 끊겨 실행하지 않음 |
 | 403 | (없음) | `guard` 가 거부 |
-| 404 | (없음) | 알 수 없는 op, 없는 ref·스태시 등 |
+| 404 | (없음) | 알 수 없는 op, 없는 ref·스태시·브랜치, 등록되지 않은 작업 트리 경로 등 |
 | 405 | (없음) | 지원하지 않는 메서드 |
 | 413 | (없음) | 본문이 1MB 초과 |
 | 500 | (없음) | 그 외 (메시지는 인증 정보를 가려서 보낸다). HTTP 처리기에서 분류 못 한 오류는 `internal error` |
 
 `CHANGED-…` 같은 코드는 이 코드베이스에 없다.
+
+### 작업 트리 관리 ([#4](https://github.com/zaruous/jsgit/issues/4))
+
+isomorphic-git 에는 worktree 명령이 없어 jsgit 이 git 과 같은 파일 배치로 직접 한다. 모두 열린 저장소(주 작업 트리든 연결된 작업 트리든)의 공통 폴더 기준이다.
+
+| op | 본문 | 응답 | 동작 |
+|---|---|---|---|
+| `worktree-list` | — | `GitWorktree[]` | 주 작업 트리 + `<공통>/worktrees/*`. 경로, HEAD, 브랜치(분리된 HEAD 면 `null`), `locked`/`lockReason`, `prunable`/`prunableReason`(git 과 같은 문구), `current`(지금 열린 작업 트리) |
+| `worktree-add` | `{ path, branch, create?, startPoint? }` | `GitWorktree[]` | `path` 는 절대 경로, 없거나 빈 폴더, `.git` 안이 아님, `worktreeRoots` 안. `create` 면 `branch` 를 `startPoint`(기본 HEAD)에서 새로 만들고, 아니면 기존 로컬 브랜치. `worktrees/<이름>/{HEAD,commondir,gitdir,index}` 와 작업 폴더의 `.git` 파일을 만들고 꺼낸다. 이름은 폴더 이름(겹치면 뒤에 1, 2…). 만드는 동안 `locked` 를 두고, 실패하면 만든 것(폴더·항목·새 브랜치)을 지운다 |
+| `worktree-remove` | `{ path, force? }` | `GitWorktree[]` | 작업 폴더와 `worktrees/<이름>` 을 지운다. 브랜치는 남긴다 |
+| `worktree-prune` | — | `{ pruned, worktrees }` | 작업 폴더나 그 `.git` 이 사라진 항목, `gitdir` 파일이 없거나 빈 항목, 폴더가 아닌 항목의 `worktrees/<이름>` 만 지운다. 잠긴 것과 작업 폴더는 건드리지 않는다 |
+
+`worktree-remove` 의 안전장치:
+- 지우는 것은 `worktrees/<이름>/gitdir` 이 가리키는 폴더뿐이고, 그 폴더의 `.git` 파일이 같은 `worktrees/<이름>` 을 되가리킬 때만 지운다 (실제 경로로 비교). 주 작업 트리·공통 폴더·지금 열린 프로젝트를 담은 폴더, 파일 시스템 루트, 여러 항목이 가리키는 폴더는 거절한다(`WORKTREE_MISMATCH`).
+- 주 작업 트리와 지금 열린 작업 트리는 400, 잠긴 작업 트리는 `force` 여도 409 `WORKTREE_LOCKED`.
+- 바뀐·올린·미추적 파일이 있으면 409 `DIRTY` (무시된 파일은 괜찮다, git 과 같다). isomorphic-git 은 stat 을 초 단위로 비교해 index 를 쓴 그 초 안에 크기가 같게 바뀐 파일을 놓치므로, 그런 파일은 내용으로 다시 비교한다.
+- 작업 폴더 안의 심볼릭 링크·junction 은 따라가지 않고 링크만 지운다.
+
+```ts
+const list = await api.listWorktrees();
+await api.addWorktree({ path: 'E:/work/app-hotfix', branch: 'hotfix', create: true, startPoint: 'v1.2.0' });
+await api.removeWorktree({ path: 'E:/work/app-hotfix' });          // 변경이 있으면 GitError code 'DIRTY'
+const { pruned } = await api.pruneWorktrees();
+```
 
 ## 보안·자원 대책
 
@@ -234,7 +263,8 @@ const gitHandler = createSingleRepoHandler({ getRoot, appName: 'exbe', ...env.op
 - **토큰은 서버 메모리에만**: 원격 인증 정보는 origin 단위로 프로세스 메모리(`creds`)에만 두고 디스크에 쓰지 않는다. `forget-auth` 로 지운다.
 - **본문 크기 제한**: 요청 본문 1MB 초과는 읽는 즉시 413.
 - **`guard` 훅**: 처리 전에 앱이 검사(동일 출처 등)하고, 문자열을 돌려주면 403.
-- **프로젝트 경로 탈출 검사** (`createPerProjectHandler`): `project` 는 워크스페이스 바로 아래 폴더 이름만, `clone` 의 `dir` 은 워크스페이스 안 절대 경로만 허용한다. clone 대상 폴더는 없거나 비어 있어야 하고, 실패하면 만든 것을 지운다.
+- **프로젝트 경로 탈출 검사** (`createPerProjectHandler`): `project` 는 워크스페이스 바로 아래 폴더 이름만, `clone` 의 `dir` 과 `worktree-add`·`worktree-remove` 의 `path` 는 워크스페이스 안 절대 경로만 허용한다. clone·작업 트리 대상 폴더는 없거나 비어 있어야 하고, 실패하면 만든 것을 지운다.
+- **작업 트리 경로** (`worktreeRoots`): 저장소 하나 방식에서도 `worktree-add` 는 허용 위치(기본: 주 작업 트리의 부모 폴더) 안쪽, `.git` 밖만 만든다. `worktree-remove` 는 위 안전장치대로 그 항목이 가리키고 되가리키는 폴더만 지운다.
 - **줄 끝·사용자 설정 격리**: 시스템·사용자 git 설정에 기대지 않고 저장소 설정(`core.autocrlf`, `.gitattributes`)만 해석한다.
 
 ### jabe#2 — pack 전체를 요청마다 다시 읽어 메모리가 급증
@@ -271,6 +301,7 @@ const gitHandler = createSingleRepoHandler({ getRoot, appName: 'exbe', ...env.op
 - `show` 의 크기 확인은 blob 을 읽은 뒤에 한다. `blame`·줄 끝 변환 등의 blob 읽기에는 별도 상한이 없다.
 - pack 크기 검사는 pack 폴더의 `mtime` 에 기대므로, 수정 시각이 안 바뀌는 방식으로 pack 이 교체되면 오래된 값을 볼 수 있다. 상한 초과 여부만 보는 안전장치이고 정확한 계량이 아니다.
 - 연결된 작업 트리(`.git` 이 파일이고 그 gitdir 에 `commondir` 이 있음): isomorphic-git 은 commondir 을 모르므로 jsgit 의 fs 래퍼(`repoFs`)가 git 의 [gitrepository-layout](https://git-scm.com/docs/gitrepository-layout) 규칙대로 경로를 나눈다. `HEAD`, `index`, `ORIG_HEAD`, `MERGE_*`, `FETCH_HEAD`, `logs/HEAD`, `refs/bisect`, `refs/worktree`, `<NAME>_CONFLICTS` 는 작업 트리 gitdir 에, `objects`, `refs`, `packed-refs`, `config`, `info`, `hooks`, `logs/refs` 는 공통 폴더에서 읽고 쓴다 ([#3](https://github.com/zaruous/jsgit/issues/3)). 줄 끝 설정(`config`, `info/attributes`)도 공통 폴더 것을 본다. 읽기·쓰기 작업 모두 지원하며, git 처럼 한 브랜치는 한 작업 트리에서만 꺼낼 수 있고(`409 BRANCH_IN_WORKTREE`), 다른 작업 트리가 꺼낸 브랜치의 이름을 바꾸면 그 작업 트리의 HEAD 도 옮긴다. `refs/stash` 는 공유 ref 라 모든 작업 트리에서 같은 stash 목록이 보인다(git 과 같다). isomorphic-git 이 stash reflog 를 git 이 읽지 못하는 형식(`name email`)으로 쓰므로 `stash-push` 뒤 `name <email>` 형식으로 고쳐 쓴다. `--separate-git-dir`·하위 모듈처럼 `commondir` 이 없는 `.git` 파일은 그대로 쓴다. isomorphic-git 은 `objects/info/alternates` 를 따르지 않으므로 `clone --shared` 저장소는 읽지 못한다(pack 크기 검사는 alternates 도 본다).
+- 작업 트리 관리는 list·add·remove·prune 만 있다. `lock`/`unlock`/`move`/`repair`, 분리된 HEAD 로 add(`--detach`), add 때 `--track`·reflog 기록은 없다. 지운 작업 트리를 다른 프로세스(다른 서비스·git.exe)가 쓰고 있는지는 알 수 없다.
 - 제한기는 프로세스 하나 안에서만 유효하다. 서버를 여러 프로세스로 띄우면 프로세스마다 따로 제한한다.
 
 ## 개발
@@ -282,8 +313,8 @@ npm test                 # vitest run 전체 (약 4분)
 npx vitest run <파일>     # 하나만
 ```
 
-- 테스트는 소스 옆에 있다: `src/server/service.test.ts`(서비스 전체, 로컬 HTTP 원격 포함), `eol.test.ts`(줄 끝 변환), `limiter.test.ts`(제한기·크기 상한), `gitdir.test.ts`(`.git` 파일 저장소·alternates 의 pack 상한), `worktree.test.ts`(연결된 작업 트리, git.exe 결과와 비교), `src/client/*.test.ts`(UI 로직).
-- 테스트는 이 PC 의 시스템·사용자 git 설정(예: Windows 용 Git 의 `core.autocrlf=true`)과 무관하게 돌도록 `GIT_CONFIG_NOSYSTEM=1` 과 존재하지 않는 `GIT_CONFIG_GLOBAL` 을 테스트 파일 맨 위에서 설정한다. 새 테스트 파일도 같게 한다. `limiter.test.ts` 는 작은 pack 을 만들려고 시스템 `git repack` 을, `worktree.test.ts` 는 작업 트리를 만들려고 `git worktree add` 를 쓰므로 git 이 PATH 에 있어야 한다 (`worktree.test.ts` 는 없으면 건너뛴다).
+- 테스트는 소스 옆에 있다: `src/server/service.test.ts`(서비스 전체, 로컬 HTTP 원격 포함), `eol.test.ts`(줄 끝 변환), `limiter.test.ts`(제한기·크기 상한), `gitdir.test.ts`(`.git` 파일 저장소·alternates 의 pack 상한), `worktree.test.ts`(연결된 작업 트리, git.exe 결과와 비교), `worktree-mgmt.test.ts`(작업 트리 list·add·remove·prune, git.exe 의 `worktree list`·`status`·`fsck` 와 비교), `src/client/*.test.ts`(UI 로직).
+- 테스트는 이 PC 의 시스템·사용자 git 설정(예: Windows 용 Git 의 `core.autocrlf=true`)과 무관하게 돌도록 `GIT_CONFIG_NOSYSTEM=1` 과 존재하지 않는 `GIT_CONFIG_GLOBAL` 을 테스트 파일 맨 위에서 설정한다. 새 테스트 파일도 같게 한다. `limiter.test.ts` 는 작은 pack 을 만들려고 시스템 `git repack` 을, `worktree.test.ts`·`worktree-mgmt.test.ts` 는 작업 트리를 만들고 비교하려고 `git worktree` 를 쓰므로 git 이 PATH 에 있어야 한다 (둘 다 없으면 건너뛴다).
 - 큰 파일을 만들지 않는다. 크기 관련 동작은 `maxPackBytes`, `maxShowBytes`, `concurrency` 같은 값을 줄여서 검증한다.
 - 코드 주석은 이 코드베이스의 평이한 한국어 문체를 따른다.
 
