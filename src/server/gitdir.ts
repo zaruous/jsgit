@@ -123,3 +123,55 @@ export function worktreeHeads(commondir: string): WorktreeHead[] {
   }
   return out;
 }
+
+/** worktree-list 용 작업 트리 항목 (jsgit#4) */
+export interface WorktreeEntry extends WorktreeHead {
+  /** worktrees/<이름> 의 이름. 주 작업 트리는 null */
+  name: string | null;
+  /** HEAD 파일 내용 ('ref: refs/heads/x' 또는 oid). 없으면 null */
+  head: string | null;
+  /** 잠김 사유 (locked 파일 내용, 빈 문자열 가능). 잠기지 않았으면 null */
+  locked: string | null;
+  /** prune 이 지울 이유 (git 과 같은 문구). 지울 대상이 아니면 null */
+  prunable: string | null;
+}
+
+/**
+ * <공통 폴더>/worktrees/<이름> 이 prune 대상인 이유 (git 의 should_prune_worktree 와 같은 규칙, expire 없음).
+ * 잠긴 것은 대상이 아니다 (null)
+ */
+export function pruneReason(admin: string): string | null {
+  let st: fs.Stats;
+  try { st = fs.statSync(admin); } catch { return null; }
+  if (!st.isDirectory()) return 'not a valid directory';
+  if (fs.existsSync(path.join(admin, 'locked'))) return null;
+  let back: string;
+  try { back = fs.readFileSync(path.join(admin, 'gitdir'), 'utf8'); } catch { return 'gitdir file does not exist'; }
+  back = back.trim();
+  if (!back) return 'invalid gitdir file';
+  if (!fs.existsSync(path.resolve(admin, back))) return 'gitdir file points to non-existent location';
+  return null;
+}
+
+/**
+ * 작업 트리 목록: 주 작업 트리 + gitdir 파일을 읽을 수 있는 worktrees/* (git worktree list 와 같은 기준, 이름순).
+ * 작업 폴더가 지워진 것도 나온다 (prunable)
+ */
+export function worktreeEntries(commondir: string): WorktreeEntry[] {
+  const bare = /^\s*bare\s*=\s*true\s*$/im.test(readTrim(path.join(commondir, 'config')) ?? '');
+  const headOf = (gd: string) => readTrim(path.join(gd, 'HEAD'));
+  const branchOf = (h: string | null) => /^ref:\s*(\S+)/.exec(h ?? '')?.[1] ?? null;
+  const h0 = headOf(commondir);
+  const out: WorktreeEntry[] = [{ name: null, gitdir: commondir, dir: bare ? null : path.dirname(commondir), head: h0, branch: branchOf(h0), locked: null, prunable: null }];
+  let names: string[] = [];
+  try { names = fs.readdirSync(path.join(commondir, 'worktrees')).sort(); } catch { /* 없음 */ }
+  for (const name of names) {
+    const gd = path.join(commondir, 'worktrees', name);
+    const back = readTrim(path.join(gd, 'gitdir'));
+    if (!back) continue;
+    const h = headOf(gd);
+    const lock = readTrim(path.join(gd, 'locked'));
+    out.push({ name, gitdir: gd, dir: path.dirname(path.resolve(gd, back)), head: h, branch: branchOf(h), locked: lock, prunable: pruneReason(gd) });
+  }
+  return out;
+}

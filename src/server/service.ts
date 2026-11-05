@@ -5,15 +5,15 @@ import git from 'isomorphic-git';
 import { httpClient as http } from './http-client.ts';
 import type {
   GitBlameRange, GitBranches, GitChangedFile, GitCommitInfo, GitFileStatus, GitMergeResult,
-  GitRemote, GitStashEntry, GitStatus, GitTag,
+  GitRemote, GitStashEntry, GitStatus, GitTag, GitWorktree,
 } from '../types.ts';
 import { matchLines } from './diff.ts';
 import { repoFs, loadAttributes, needsEol, readEolConfig, toRepo, type EolContext } from './eol.ts';
-import { gitDirs, packDirs, worktreeHeads, type GitDirs } from './gitdir.ts';
+import { gitDirs, packDirs, worktreeEntries, worktreeHeads, type GitDirs } from './gitdir.ts';
 import { ProgressHub } from './progress.ts';
 import { setWorkConcurrency, workLimiter, type Lane } from './limiter.ts';
 import {
-  GitError, assertRemoteUrl, cleanPath, cleanPaths, cleanRefName, cleanRev, originOf, scrub,
+  GitError, assertRemoteUrl, cleanPath, cleanPaths, cleanRefName, cleanRev, isInside, originOf, scrub,
 } from './util.ts';
 
 export interface GitServiceOptions {
@@ -39,6 +39,11 @@ export interface GitServiceOptions {
    * 서비스 하나가 아니라 프로세스 전체에 적용된다 (setWorkConcurrency 와 같다)
    */
   concurrency?: { local?: number; network?: number };
+  /**
+   * worktree-add 가 새 작업 폴더를 만들 수 있는 폴더들 (그 안쪽만 허용). 기본: 주 작업 트리의 부모 폴더 (형제 폴더와 그 아래).
+   * 심볼릭 링크는 풀어서 비교한다 (jsgit#4)
+   */
+  worktreeRoots?: () => string[];
 }
 
 type Obj = Record<string, unknown>;
@@ -373,17 +378,72 @@ export function createGitService(opts: GitServiceOptions) {
 
   // ---------- 작업 트리 사이의 브랜치 (git 과 같은 규칙: 한 브랜치는 한 작업 트리에서만 꺼낸다) ----------
   const samePath = (a: string, b: string) => path.relative(a, b) === '';
-  /** 다른 작업 트리(주 작업 트리 포함)가 꺼내 둔 브랜치면 그 작업 트리 폴더 (없으면 null). HEAD 는 commondir 의 HEAD, worktrees/*\/HEAD 에서 읽는다 */
-  function usedByOtherWorktree(r: Repo, branch: string): string | null {
+  /**
+   * 다른 작업 트리(주 작업 트리 포함)가 꺼내 둔 브랜치면 그 작업 트리 폴더 (없으면 null). HEAD 는 commondir 의 HEAD, worktrees/*\/HEAD 에서 읽는다.
+   * includeSelf 면 지금 작업 트리도 본다 (worktree-add)
+   */
+  function usedByOtherWorktree(r: Repo, branch: string, includeSelf = false): string | null {
     const full = 'refs/heads/' + branch;
     for (const w of worktreeHeads(r.commondir)) {
-      if (!samePath(w.gitdir, r.gitdir) && w.branch === full) return norm(w.dir ?? w.gitdir);
+      if ((includeSelf || !samePath(w.gitdir, r.gitdir)) && w.branch === full) return norm(w.dir ?? w.gitdir);
     }
     return null;
   }
-  function assertNotInOtherWorktree(r: Repo, branch: string, what: string): void {
-    const at = usedByOtherWorktree(r, branch);
+  function assertNotInOtherWorktree(r: Repo, branch: string, what: string, includeSelf = false): void {
+    const at = usedByOtherWorktree(r, branch, includeSelf);
     if (at) throw new GitError(409, `cannot ${what} branch '${branch}': it is checked out in another worktree at ${at}`, 'BRANCH_IN_WORKTREE', { branch, worktree: at });
+  }
+
+  // ---------- 작업 트리 관리 (jsgit#4) ----------
+  /** 작업 트리 목록. HEAD 의 브랜치는 공통 폴더의 ref 로 푼다 */
+  async function worktreeList(r: Repo): Promise<GitWorktree[]> {
+    const out: GitWorktree[] = [];
+    for (const w of worktreeEntries(r.commondir)) {
+      let head: string | null = null;
+      if (w.branch) {
+        try { head = await git.resolveRef({ fs, gitdir: r.commondir, ref: w.branch }); } catch { head = null; }
+      } else if (w.head && /^[0-9a-f]{40}$/.test(w.head)) head = w.head;
+      out.push({
+        path: w.dir ? norm(w.dir) : null,
+        name: w.name,
+        main: w.name === null,
+        current: samePath(w.gitdir, r.gitdir),
+        head,
+        branch: w.branch ? w.branch.replace(/^refs\/heads\//, '') : null,
+        locked: w.locked !== null,
+        ...(w.locked ? { lockReason: w.locked } : {}),
+        prunable: w.prunable !== null,
+        ...(w.prunable ? { prunableReason: w.prunable } : {}),
+      });
+    }
+    return out;
+  }
+
+  /**
+   * worktree-add 대상 폴더 검사: 절대 경로, 없거나 빈 폴더 (clone 과 같은 기준), .git 안이 아님,
+   * 허용 위치(worktreeRoots, 기본 주 작업 트리의 부모 폴더) 안쪽, 이미 등록된 작업 트리 경로가 아님
+   */
+  function worktreeTarget(r: Repo, p: unknown): string {
+    if (typeof p !== 'string' || !p || p.includes('\0') || !path.isAbsolute(p)) throw new GitError(400, 'path must be an absolute path');
+    const full = path.resolve(p);
+    if (full.split(/[\\/]/).some((x) => x.toLowerCase() === '.git') || isInside(r.commondir, full) || samePath(r.commondir, full)) {
+      throw new GitError(400, 'path inside .git is not allowed');
+    }
+    if (fs.existsSync(full) && (!fs.statSync(full).isDirectory() || fs.readdirSync(full).length > 0)) throw new GitError(400, 'target directory must not exist or be empty');
+    const roots = opts.worktreeRoots?.() ?? [path.dirname(path.dirname(r.commondir))];
+    if (!roots.some((root) => isInside(root, full))) throw new GitError(400, 'path is outside the allowed folders');
+    for (const w of worktreeEntries(r.commondir)) {
+      if (w.dir && samePath(w.dir, full)) throw new GitError(409, `already registered as a worktree: ${norm(full)} (use worktree-prune or worktree-remove)`, 'WORKTREE_EXISTS', { worktree: norm(full) });
+    }
+    return full;
+  }
+
+  /** worktrees/<이름> 의 이름: 폴더 이름에서 git 처럼 만들고, 겹치면 뒤에 1, 2, ... */
+  function worktreeName(commondir: string, full: string): string {
+    const base = path.basename(full).replace(/[^A-Za-z0-9._-]/g, '-').replace(/^[.-]+/, '').replace(/\.lock$/i, '-lock') || 'worktree';
+    let name = base;
+    for (let i = 1; fs.existsSync(path.join(commondir, 'worktrees', name)); i++) name = base + i;
+    return name;
   }
 
   function commitInfo(c: { oid: string; commit: { message: string; author: { name: string; email: string; timestamp: number }; committer: { name: string; email: string; timestamp: number }; parent: string[] } }): GitCommitInfo {
@@ -936,6 +996,54 @@ export function createGitService(opts: GitServiceOptions) {
         return tagsOf(r);
       });
     },
+    // ----- 작업 트리 관리 (jsgit#4) -----
+    async 'worktree-list'() { return worktreeList(await needRepo()); },
+    async 'worktree-add'(b) {
+      const r = await needRepo();
+      const full = worktreeTarget(r, b.path);
+      const branch = cleanRefName(b.branch, 'branch');
+      const create = b.create === true;
+      return locked(r.commondir, async () => {
+        const locals = await git.listBranches({ fs: r.fs, dir: r.dir });
+        let start: string | null = null;
+        if (create) {
+          if (locals.includes(branch)) throw new GitError(409, `branch already exists: ${branch}`);
+          start = b.startPoint === undefined ? await headOid(r) : await resolveOid(r, cleanRev(b.startPoint, 'startPoint'));
+          if (!start) throw new GitError(400, 'no commits yet');
+        } else {
+          if (!locals.includes(branch)) throw new GitError(404, `unknown branch: ${branch}`);
+          assertNotInOtherWorktree(r, branch, 'add a worktree for', true);
+        }
+        const name = worktreeName(r.commondir, full);
+        const admin = path.join(r.commondir, 'worktrees', name);
+        const existed = fs.existsSync(full);
+        const slash = (p: string) => p.replace(/\\/g, '/');
+        let branchMade = false;
+        try {
+          // git 처럼 만드는 동안 잠가 둔다 (그 사이 prune 이 지우지 않게)
+          fs.mkdirSync(admin, { recursive: true });
+          fs.writeFileSync(path.join(admin, 'locked'), 'initializing\n');
+          fs.mkdirSync(full, { recursive: true });
+          fs.writeFileSync(path.join(admin, 'gitdir'), slash(path.join(full, '.git')) + '\n');
+          fs.writeFileSync(path.join(admin, 'commondir'), '../..\n');
+          fs.writeFileSync(path.join(full, '.git'), `gitdir: ${slash(admin)}\n`);
+          if (create) { await git.branch({ fs: r.fs, dir: r.dir, ref: branch, object: start! }); branchMade = true; }
+          fs.writeFileSync(path.join(admin, 'HEAD'), `ref: refs/heads/${branch}\n`);
+          // 새 작업 트리를 열어 꺼낸다 (index 는 그 작업 트리 gitdir 에 생긴다)
+          const w = withEol(full);
+          await w.eol?.preload?.();
+          await git.checkout({ fs: w.fs, dir: w.dir, ref: branch, cache: w.cache });
+          fs.rmSync(path.join(admin, 'locked'), { force: true });
+        } catch (e) {
+          fs.rmSync(admin, { recursive: true, force: true });
+          if (!existed) fs.rmSync(full, { recursive: true, force: true });
+          else for (const n of fs.readdirSync(full)) fs.rmSync(path.join(full, n), { recursive: true, force: true });
+          if (branchMade) { try { await git.deleteBranch({ fs: r.fs, dir: r.dir, ref: branch }); } catch { /* 무시 */ } }
+          throw e;
+        }
+        return worktreeList(r);
+      });
+    },
     async blame(b) {
       const r = await needRepo();
       return blame(r, cleanPath(b.path), b.ref === undefined ? 'HEAD' : cleanRev(b.ref), optInt(b.maxCommits, 200, 5000) || 200);
@@ -1038,7 +1146,7 @@ export function createGitService(opts: GitServiceOptions) {
   const MUTATING = new Set(['stage', 'unstage', 'discard', 'init', 'identity-set', 'remote-set']);
 
   // 제한기를 거치지 않는 가벼운 작업 (pack·객체를 읽지 않는다)
-  const UNLIMITED = new Set(['auth', 'forget-auth', 'init', 'branches', 'remotes', 'remote-set', 'identity', 'identity-set']);
+  const UNLIMITED = new Set(['auth', 'forget-auth', 'init', 'branches', 'remotes', 'remote-set', 'identity', 'identity-set', 'worktree-list']);
   const NETWORK = new Set(['clone', 'fetch', 'pull', 'push']);
   const laneOf = (op: string): Lane | null => (UNLIMITED.has(op) ? null : NETWORK.has(op) ? 'network' : 'local');
 

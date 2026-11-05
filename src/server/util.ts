@@ -1,4 +1,6 @@
 // git API 공통: 오류 형식, 경로/주소 검증, 비밀 값 가리기.
+import fs from 'node:fs';
+import path from 'node:path';
 
 export class GitError extends Error {
   status: number;
@@ -76,4 +78,19 @@ export function assertRemoteUrl(url: unknown, allowLocal: boolean, opts: { allow
 
 export function originOf(url: string): string {
   try { return new URL(url).origin; } catch { return url; }
+}
+
+/** 실제 경로 (심볼릭 링크·8.3 이름을 푼다). 없는 경로는 있는 조상까지 풀고 나머지를 붙인다 */
+export function realPathish(p: string): string {
+  const full = path.resolve(p);
+  try { return fs.realpathSync.native(full); } catch {
+    const up = path.dirname(full);
+    return up === full ? full : path.join(realPathish(up), path.basename(full));
+  }
+}
+
+/** child 가 root 의 안쪽인가 (같은 경로는 아니다). 둘 다 실제 경로로 비교한다 */
+export function isInside(root: string, child: string): boolean {
+  const rel = path.relative(realPathish(root), realPathish(child));
+  return !!rel && rel !== '..' && !rel.startsWith('..' + path.sep) && !path.isAbsolute(rel);
 }

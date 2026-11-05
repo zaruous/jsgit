@@ -104,3 +104,24 @@ export interface GitMergeResult {
   oid?: string;
   conflicts?: string[];
 }
+
+/** 작업 트리 하나 (worktree-list). 주 작업 트리가 먼저, 그다음 <공통 폴더>/worktrees/<이름> 들 (jsgit#4) */
+export interface GitWorktree {
+  /** 작업 폴더 절대 경로 (/ 구분). 주 작업 트리는 공통 폴더의 부모, 연결된 것은 worktrees/<이름>/gitdir 이 가리키는 곳 */
+  path: string | null;
+  /** worktrees/<이름> 의 이름. 주 작업 트리는 null */
+  name: string | null;
+  main: boolean;
+  /** 지금 열린 프로젝트가 이 작업 트리인가 */
+  current: boolean;
+  /** HEAD 커밋 (아직 커밋이 없으면 null) */
+  head: string | null;
+  /** 꺼낸 브랜치 (짧은 이름). 분리된 HEAD 면 null */
+  branch: string | null;
+  /** worktrees/<이름>/locked 가 있음 (remove·prune 대상이 아니다) */
+  locked: boolean;
+  lockReason?: string;
+  /** 작업 폴더가 사라지는 등으로 prune 이 지울 항목 (git worktree list 의 prunable 과 같다) */
+  prunable: boolean;
+  prunableReason?: string;
+}
