@@ -11,6 +11,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { gitDirs, isLinkedWorktree, mapGitPath, type GitDirs } from './gitdir.ts';
 
 export type AutoCrlf = 'true' | 'input' | 'false';
 
@@ -68,16 +69,19 @@ export function globalConfigPaths(): string[] {
 
 const readText = (f: string): string => { try { return fs.readFileSync(f, 'utf8'); } catch { return ''; } };
 
-/** 저장소에 적용되는 줄 끝 설정. paths 는 시험용 (기본: 시스템 → 사용자 → 저장소 순으로 덮어쓴다) */
+/** 저장소의 공통 폴더 (.git 파일·commondir 을 따른다). 없으면 <dir>/.git */
+const commonOf = (repoDir: string) => gitDirs(repoDir)?.commondir ?? path.join(repoDir, '.git');
+
+/** 저장소에 적용되는 줄 끝 설정. paths 는 시험용 (기본: 시스템 → 사용자 → 저장소 순으로 덮어쓴다). 저장소 config 는 공통 폴더의 것 */
 export function readEolConfig(repoDir: string, paths?: { system?: string[]; global?: string[] }): EolConfig {
-  const files = [...(paths?.system ?? systemConfigPaths()), ...(paths?.global ?? globalConfigPaths()), path.join(repoDir, '.git', 'config')];
+  const files = [...(paths?.system ?? systemConfigPaths()), ...(paths?.global ?? globalConfigPaths()), path.join(commonOf(repoDir), 'config')];
   const cfg: EolConfig = { autocrlf: 'false', eol: 'native' };
   for (const f of files) Object.assign(cfg, parseCoreEol(readText(f)));
   return cfg;
 }
 
 // ---------------------------------------------------------------------------
-// .gitattributes (저장소 루트 것과 .git/info/attributes 만, 줄 끝 관련 속성만)
+// .gitattributes (저장소 루트 것과 <공통 폴더>/info/attributes 만, 줄 끝 관련 속성만)
 
 interface AttrRule { re: RegExp; attrs: EolAttrs }
 
@@ -199,7 +203,7 @@ export function needsEol(cfg: EolConfig, rules: AttrRule[]): boolean {
 }
 
 export function loadAttributes(dir: string): AttrRule[] {
-  return [...parseAttributes(readText(path.join(dir, '.git', 'info', 'attributes'))), ...parseAttributes(readText(path.join(dir, '.gitattributes')))];
+  return [...parseAttributes(readText(path.join(commonOf(dir), 'info', 'attributes'))), ...parseAttributes(readText(path.join(dir, '.gitattributes')))];
 }
 
 /** 넣을 때 변환: 작업 폴더 내용 → 저장소에 들어갈 내용 */
@@ -245,11 +249,34 @@ function gitStats(st: fs.Stats): fs.Stats {
   return Object.create(st, { ctimeMs: { value: st.birthtimeMs }, ctime: { value: st.birthtime } }) as fs.Stats;
 }
 
+/** 경로 인자를 바꾸는 fs.promises 함수들: 인자 위치 */
+const PATH_ARGS: Record<string, number[]> = {
+  readFile: [0], writeFile: [0], appendFile: [0], mkdir: [0], rmdir: [0], rm: [0], unlink: [0], stat: [0], lstat: [0],
+  readdir: [0], readlink: [0], symlink: [1], access: [0], open: [0], chmod: [0], utimes: [0], realpath: [0],
+  rename: [0, 1], cp: [0, 1], copyFile: [0, 1], link: [0, 1],
+};
+
+/** 연결된 작업 트리면 gitdir 아래 공통 경로를 commondir 로 보내는 fs (jsgit#3). 아니면 그대로 */
+function mapPaths(promises: typeof fs.promises, dirs: GitDirs | null | undefined): typeof fs.promises {
+  if (!dirs || !isLinkedWorktree(dirs)) return promises;
+  const out: Record<string, unknown> = { ...promises };
+  for (const [name, idx] of Object.entries(PATH_ARGS)) {
+    const f = (promises as unknown as Record<string, unknown>)[name];
+    if (typeof f !== 'function') continue;
+    out[name] = (...args: unknown[]) => {
+      for (const i of idx) if (typeof args[i] === 'string') args[i] = mapGitPath(dirs, args[i] as string);
+      return (f as (...a: unknown[]) => unknown).apply(promises, args);
+    };
+  }
+  return out as unknown as typeof fs.promises;
+}
+
 /**
  * isomorphic-git 에 넘길 fs. 작업 폴더 파일에 대해서만: readFile / writeFile 은 줄 끝 변환(ctx 가 있을 때),
  * lstat / stat 은 명령줄 git 과 같은 ctime. .git 안은 그대로 둔다.
+ * dirs 가 연결된 작업 트리면 gitdir 아래 공통 경로(objects, refs, config, ...)를 commondir 로 보낸다 (isomorphic-git 은 commondir 을 모른다)
  */
-export function repoFs(dir: string, ctx: EolContext | null): { promises: typeof fs.promises } {
+export function repoFs(dir: string, ctx: EolContext | null, dirs?: GitDirs | null): { promises: typeof fs.promises } {
   const p = fs.promises;
   const promises = {
     ...p,
@@ -262,7 +289,7 @@ export function repoFs(dir: string, ctx: EolContext | null): { promises: typeof 
       return workRel(dir, file) === null ? st : gitStats(st as fs.Stats);
     }) as typeof p.stat,
   };
-  if (!ctx) return { promises } as { promises: typeof fs.promises };
+  if (!ctx) return { promises: mapPaths(promises as typeof fs.promises, dirs) };
   Object.assign(promises, {
     readFile: (async (file: fs.PathLike | fs.promises.FileHandle, options?: unknown) => {
       const rel = workRel(dir, file);
@@ -277,5 +304,5 @@ export function repoFs(dir: string, ctx: EolContext | null): { promises: typeof 
       return p.writeFile(file, data as never, options as never);
     }) as typeof p.writeFile,
   });
-  return { promises } as { promises: typeof fs.promises };
+  return { promises: mapPaths(promises as typeof fs.promises, dirs) };
 }

@@ -36,7 +36,7 @@ export interface GitStatus {
   behind: number | null;
   /** 병합 중 (MERGE_HEAD 있음) */
   merging: boolean;
-  /** isRepo 가 false 인 이유. 'worktree': 연결된 작업 트리(git worktree add)라 아직 다루지 않음 (jsgit#1). 다른 작업은 409 UNSUPPORTED_WORKTREE */
+  /** @deprecated jsgit#3 부터 연결된 작업 트리도 읽으므로 더 이상 채우지 않는다 (예전 클라이언트 호환용으로 남김) */
   unsupported?: 'worktree';
   /** HEAD 와 다른 파일만 (unmodified 제외, ignored 제외) */
   files: GitFileStatus[];

@@ -65,3 +65,61 @@ export function packDirs(commondir: string): string[] {
   visit(path.join(commondir, 'objects'), 0);
   return out;
 }
+
+// ---------------------------------------------------------------------------
+// 연결된 작업 트리의 경로 나누기 (git 의 path.c common_list 와 같은 규칙)
+
+/** 공통 폴더에 있는 최상위 이름 */
+const COMMON_TOP = new Set(['branches', 'common', 'hooks', 'info', 'logs', 'lost-found', 'objects', 'refs', 'remotes', 'rr-cache', 'svn', 'worktrees', 'config', 'gc.pid', 'packed-refs', 'shallow']);
+/** 공통 이름 아래지만 작업 트리마다 따로 있는 경로 */
+const PER_WORKTREE = ['info/sparse-checkout', 'logs/HEAD', 'logs/refs/bisect', 'logs/refs/rewritten', 'logs/refs/worktree', 'refs/bisect', 'refs/rewritten', 'refs/worktree'];
+
+/**
+ * gitdir 기준 상대 경로(/ 구분)가 공통 폴더 쪽인가. 그 밖의 것(HEAD, index, ORIG_HEAD, MERGE_*, FETCH_HEAD,
+ * <NAME>_CONFLICTS, config.worktree 등)은 작업 트리별 gitdir 에 둔다
+ */
+export function isCommonPath(rel: string): boolean {
+  if (!rel || rel === '.') return false;
+  for (const p of PER_WORKTREE) if (rel === p || rel.startsWith(p + '/')) return false;
+  return COMMON_TOP.has(rel.split('/')[0]);
+}
+
+/**
+ * 파일 경로를 실제 위치로 바꾼다: 연결된 작업 트리의 gitdir 아래 공통 경로면 commondir 쪽으로.
+ * 연결된 작업 트리가 아니거나 gitdir 밖의 경로는 그대로
+ */
+export function mapGitPath(d: GitDirs, file: string): string {
+  const rel = path.relative(d.gitdir, path.resolve(file));
+  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return file;
+  const n = rel.split(path.sep).join('/');
+  return isCommonPath(n) ? path.join(d.commondir, rel) : file;
+}
+
+/** 공통 폴더의 작업 트리 하나 */
+export interface WorktreeHead {
+  /** 그 작업 트리의 gitdir (주 작업 트리면 commondir) */
+  gitdir: string;
+  /** 작업 폴더 (주 작업 트리는 commondir 의 부모로 본다, 연결된 것은 gitdir/gitdir 파일에서) */
+  dir: string | null;
+  /** HEAD 가 가리키는 브랜치 (refs/heads/x), 분리된 HEAD 면 null */
+  branch: string | null;
+}
+
+/** commondir 을 쓰는 작업 트리들(주 작업 트리 + worktrees/*)의 HEAD. 지워진 작업 트리 폴더도 그대로 나온다 */
+export function worktreeHeads(commondir: string): WorktreeHead[] {
+  const headOf = (gd: string) => {
+    const m = /^ref:\s*(\S+)/.exec(readTrim(path.join(gd, 'HEAD')) ?? '');
+    return m ? m[1] : null;
+  };
+  const bare = /^\s*bare\s*=\s*true\s*$/im.test(readTrim(path.join(commondir, 'config')) ?? '');
+  const out: WorktreeHead[] = [{ gitdir: commondir, dir: bare ? null : path.dirname(commondir), branch: headOf(commondir) }];
+  let names: string[] = [];
+  try { names = fs.readdirSync(path.join(commondir, 'worktrees')); } catch { /* 없음 */ }
+  for (const n of names) {
+    const gd = path.join(commondir, 'worktrees', n);
+    if (!fs.existsSync(path.join(gd, 'HEAD'))) continue;
+    const back = readTrim(path.join(gd, 'gitdir'));
+    out.push({ gitdir: gd, dir: back ? path.dirname(path.resolve(gd, back)) : null, branch: headOf(gd) });
+  }
+  return out;
+}

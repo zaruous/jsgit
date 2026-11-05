@@ -211,7 +211,7 @@ const gitHandler = createSingleRepoHandler({ getRoot, appName: 'exbe', ...env.op
 | 400 | `NO_IDENTITY` | `user.name`/`user.email` 이 없음 |
 | 400 | `NO_PROJECT` | 열린 프로젝트가 없거나 `project` 가 잘못됨 |
 | 400 | `NOT_REPO` | git 저장소가 아님 |
-| 409 | `UNSUPPORTED_WORKTREE` | 연결된 작업 트리(`git worktree add` 로 만든 폴더)라 아직 다루지 않음. `status` 는 오류 대신 `isRepo: false, unsupported: 'worktree'` 를 돌려준다 ([#1](https://github.com/zaruous/jsgit/issues/1)) |
+| 409 | `UNSUPPORTED_WORKTREE` | 연결된 작업 트리(`git worktree add` 로 만든 폴더)에서 아직 지원하지 않는 작업. 읽기(status, show, log, changes, branches, remotes, identity, stash-list, tags, blame)는 지원한다 ([#3](https://github.com/zaruous/jsgit/issues/3)) |
 | 413 | `TOO_LARGE` | `show` 대상이 `maxShowBytes` 초과. `size`, `limit` |
 | 413 | `PACK_TOO_LARGE` | pack 이 `maxPackBytes` 초과. `pack`, `bytes`, `limit` |
 | 499 | `ABORTED` | 요청 연결이 끊겨 실행하지 않음 |
@@ -270,7 +270,7 @@ const gitHandler = createSingleRepoHandler({ getRoot, appName: 'exbe', ...env.op
 - fetch/pull 은 받은 pack 전체를 모은 뒤 한 번 더 복사하고, push 는 보낼 pack 을 통째로 만든 뒤 HTTP 클라이언트가 한 번 더 모은다. 이쪽에는 크기 상한이 없고, network 작업이 local 작업과 겹치면 최고치가 합쳐진다.
 - `show` 의 크기 확인은 blob 을 읽은 뒤에 한다. `blame`·줄 끝 변환 등의 blob 읽기에는 별도 상한이 없다.
 - pack 크기 검사는 pack 폴더의 `mtime` 에 기대므로, 수정 시각이 안 바뀌는 방식으로 pack 이 교체되면 오래된 값을 볼 수 있다. 상한 초과 여부만 보는 안전장치이고 정확한 계량이 아니다.
-- 연결된 작업 트리(`.git` 이 파일이고 그 gitdir 에 `commondir` 이 있음)는 isomorphic-git 이 공통 저장소를 따르지 않아 HEAD 없음·모든 파일 '추가됨'으로 잘못 보이므로 지원할 때까지 거절한다 ([#1](https://github.com/zaruous/jsgit/issues/1)). 주 작업 트리를 열면 된다. `--separate-git-dir`·하위 모듈처럼 `commondir` 이 없는 `.git` 파일은 그대로 쓴다(단 pack 크기 검사는 `.git/objects/pack` 만 본다).
+- 연결된 작업 트리(`.git` 이 파일이고 그 gitdir 에 `commondir` 이 있음): isomorphic-git 은 commondir 을 모르므로 jsgit 의 fs 래퍼(`repoFs`)가 git 의 [gitrepository-layout](https://git-scm.com/docs/gitrepository-layout) 규칙대로 경로를 나눈다. `HEAD`, `index`, `ORIG_HEAD`, `MERGE_*`, `FETCH_HEAD`, `logs/HEAD`, `refs/bisect`, `refs/worktree`, `<NAME>_CONFLICTS` 는 작업 트리 gitdir 에, `objects`, `refs`, `packed-refs`, `config`, `info`, `hooks`, `logs/refs` 는 공통 폴더에서 읽고 쓴다 ([#3](https://github.com/zaruous/jsgit/issues/3)). 줄 끝 설정(`config`, `info/attributes`)도 공통 폴더 것을 본다. `--separate-git-dir`·하위 모듈처럼 `commondir` 이 없는 `.git` 파일은 그대로 쓴다. isomorphic-git 은 `objects/info/alternates` 를 따르지 않으므로 `clone --shared` 저장소는 읽지 못한다(pack 크기 검사는 alternates 도 본다).
 - 제한기는 프로세스 하나 안에서만 유효하다. 서버를 여러 프로세스로 띄우면 프로세스마다 따로 제한한다.
 
 ## 개발
@@ -282,7 +282,7 @@ npm test                 # vitest run 전체 (약 4분)
 npx vitest run <파일>     # 하나만
 ```
 
-- 테스트는 소스 옆에 있다: `src/server/service.test.ts`(서비스 전체, 로컬 HTTP 원격 포함), `eol.test.ts`(줄 끝 변환), `limiter.test.ts`(제한기·크기 상한), `gitdir.test.ts`(`.git` 파일 저장소·alternates 의 pack 상한), `worktree.test.ts`(연결된 작업 트리 거절), `src/client/*.test.ts`(UI 로직).
+- 테스트는 소스 옆에 있다: `src/server/service.test.ts`(서비스 전체, 로컬 HTTP 원격 포함), `eol.test.ts`(줄 끝 변환), `limiter.test.ts`(제한기·크기 상한), `gitdir.test.ts`(`.git` 파일 저장소·alternates 의 pack 상한), `worktree.test.ts`(연결된 작업 트리, git.exe 결과와 비교), `src/client/*.test.ts`(UI 로직).
 - 테스트는 이 PC 의 시스템·사용자 git 설정(예: Windows 용 Git 의 `core.autocrlf=true`)과 무관하게 돌도록 `GIT_CONFIG_NOSYSTEM=1` 과 존재하지 않는 `GIT_CONFIG_GLOBAL` 을 테스트 파일 맨 위에서 설정한다. 새 테스트 파일도 같게 한다. `limiter.test.ts` 는 작은 pack 을 만들려고 시스템 `git repack` 을, `worktree.test.ts` 는 작업 트리를 만들려고 `git worktree add` 를 쓰므로 git 이 PATH 에 있어야 한다 (`worktree.test.ts` 는 없으면 건너뛴다).
 - 큰 파일을 만들지 않는다. 크기 관련 동작은 `maxPackBytes`, `maxShowBytes`, `concurrency` 같은 값을 줄여서 검증한다.
 - 코드 주석은 이 코드베이스의 평이한 한국어 문체를 따른다.

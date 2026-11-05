@@ -8,7 +8,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { createGitService } from './service.ts';
-import { gitDirs, packDirs } from './gitdir.ts';
+import { gitDirs, isCommonPath, mapGitPath, packDirs } from './gitdir.ts';
 
 process.env.GIT_CONFIG_NOSYSTEM = '1';
 process.env.GIT_CONFIG_GLOBAL = path.join(os.tmpdir(), 'jsgit-git-test-no-global-config');
@@ -96,5 +96,24 @@ describe.skipIf(!hasGit)('pack 크기 상한: .git 이 파일인 저장소 (jsgi
     expect(path.relative(d.gitdir, path.join(dotGit, 'worktrees', 'wt'))).toBe('');
     expect(path.relative(d.commondir, dotGit)).toBe('');
     expect(gitDirs(base)).toBeNull();
+  });
+});
+
+describe('연결된 작업 트리 경로 나누기 (jsgit#3)', () => {
+  it('isCommonPath: git 의 common_list 와 같은 규칙', () => {
+    for (const p of ['objects/pack/x.pack', 'refs/heads/main', 'refs/stash', 'refs/tags/v1', 'packed-refs', 'config', 'info/exclude', 'hooks/pre-commit', 'logs/refs/heads/main', 'logs/refs/stash', 'worktrees/wt/HEAD', 'shallow']) {
+      expect([p, isCommonPath(p)]).toEqual([p, true]);
+    }
+    for (const p of ['HEAD', 'index', 'ORIG_HEAD', 'MERGE_HEAD', 'MERGE_MSG', 'FETCH_HEAD', 'JSGIT_CONFLICTS', 'logs/HEAD', 'refs/bisect/bad', 'refs/worktree/x', 'logs/refs/worktree/x', 'info/sparse-checkout', 'config.worktree', '']) {
+      expect([p, isCommonPath(p)]).toEqual([p, false]);
+    }
+  });
+
+  it('mapGitPath: gitdir 아래 공통 경로만 commondir 로', () => {
+    const d = { gitdir: path.resolve('/r/.git/worktrees/w'), commondir: path.resolve('/r/.git') };
+    expect(mapGitPath(d, path.join(d.gitdir, 'HEAD'))).toBe(path.join(d.gitdir, 'HEAD'));
+    expect(mapGitPath(d, path.join(d.gitdir, 'refs', 'heads', 'x'))).toBe(path.join(d.commondir, 'refs', 'heads', 'x'));
+    expect(mapGitPath(d, d.gitdir.split(path.sep).join('/') + '/objects/ab/cd')).toBe(path.join(d.commondir, 'objects', 'ab', 'cd'));
+    expect(mapGitPath(d, path.resolve('/r/work/a.txt'))).toBe(path.resolve('/r/work/a.txt'));
   });
 });

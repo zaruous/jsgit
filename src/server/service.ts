@@ -9,7 +9,7 @@ import type {
 } from '../types.ts';
 import { matchLines } from './diff.ts';
 import { repoFs, loadAttributes, needsEol, readEolConfig, toRepo, type EolContext } from './eol.ts';
-import { gitDirs, packDirs } from './gitdir.ts';
+import { gitDirs, isLinkedWorktree, packDirs, type GitDirs } from './gitdir.ts';
 import { ProgressHub } from './progress.ts';
 import { setWorkConcurrency, workLimiter, type Lane } from './limiter.ts';
 import {
@@ -47,8 +47,11 @@ type Obj = Record<string, unknown>;
 export interface RunControl {
   signal?: AbortSignal;
 }
-/** fs: isomorphic-git 에 넘기는 파일 시스템 (repoFs: 줄 끝 변환·Windows ctime 보정), eol: 줄 끝 변환 규칙 (필요 없으면 null) */
-interface Repo { dir: string; cache: object; fs: typeof fs | { promises: typeof fs.promises }; eol: EolContext | null }
+/**
+ * fs: isomorphic-git 에 넘기는 파일 시스템 (repoFs: 줄 끝 변환·Windows ctime 보정·연결된 작업 트리 경로 나누기), eol: 줄 끝 변환 규칙 (필요 없으면 null).
+ * gitdir: 이 작업 폴더의 gitdir (HEAD, index, MERGE_*), commondir: 공통 폴더 (objects, refs, config). 보통은 둘 다 <dir>/.git
+ */
+interface Repo { dir: string; gitdir: string; commondir: string; linked: boolean; cache: object; fs: typeof fs | { promises: typeof fs.promises }; eol: EolContext | null }
 type Cb = Pick<Parameters<typeof git.fetch>[0], 'http' | 'onAuth' | 'onAuthFailure' | 'onProgress'>;
 
 const LOG_CAP = 1000; // ahead/behind 계산 시 거슬러 올라가는 커밋 수 상한
@@ -101,27 +104,15 @@ export function createGitService(opts: GitServiceOptions) {
   }
 
   /**
-   * 연결된 작업 트리(git worktree add)인가. 그 .git 은 'gitdir: <공통 저장소>/worktrees/<이름>' 을 가리키는 파일이고,
-   * 그 폴더에 commondir 이 있다. isomorphic-git 은 commondir 을 따르지 않아 HEAD 없음·모든 파일 '추가됨'·빈 기록으로 잘못 보이고,
-   * 쓰기 작업은 저장소를 망가뜨릴 수 있으므로 지원할 때까지 거절한다 (jsgit#1). 하위 모듈(.git 파일이지만 commondir 없음)은 그대로 쓴다
+   * 연결된 작업 트리(git worktree add): .git 이 'gitdir: <공통>/worktrees/<이름>' 파일이고 그 폴더에 commondir 이 있다.
+   * isomorphic-git 은 commondir 을 모르므로 repoFs 가 공통 경로(objects, refs, config, ...)를 commondir 로 보낸다 (jsgit#3)
    */
-  function linkedWorktree(dir: string): string | null {
-    const dotGit = path.join(dir, '.git');
-    try {
-      if (!fs.statSync(dotGit).isFile()) return null;
-      const m = /^gitdir:\s*(.+?)\s*$/m.exec(fs.readFileSync(dotGit, 'utf8'));
-      if (!m) return null;
-      const gitdir = path.resolve(dir, m[1]);
-      return fs.existsSync(path.join(gitdir, 'commondir')) ? gitdir : null;
-    } catch { return null; }
-  }
   const unsupportedWorktree = (dir: string) =>
-    new GitError(409, `linked worktrees are not supported yet: ${norm(dir)} (open the main working tree instead)`, 'UNSUPPORTED_WORKTREE');
+    new GitError(409, `this operation is not supported in a linked worktree yet: ${norm(dir)} (use the main working tree or the system git CLI)`, 'UNSUPPORTED_WORKTREE');
 
   async function findRepo(): Promise<Repo | null> {
     const dir = findDir();
     if (!dir) return null;
-    if (linkedWorktree(dir)) throw unsupportedWorktree(dir);
     // 캐시는 요청마다 새로 만든다 (같은 ms 안에 인덱스를 다시 쓰면 오래된 캐시를 믿을 수 있음)
     const r = withEol(dir);
     if (r.eol) await r.eol.preload?.();
@@ -131,15 +122,18 @@ export function createGitService(opts: GitServiceOptions) {
   /** 저장소의 줄 끝 설정(시스템·사용자·저장소 core.autocrlf, .gitattributes)에 맞는 fs 를 붙인다 */
   function withEol(dir: string): Repo {
     const cache = {};
+    const dirs: GitDirs = gitDirs(dir) ?? { gitdir: path.join(dir, '.git'), commondir: path.join(dir, '.git') };
+    const base = { dir, gitdir: dirs.gitdir, commondir: dirs.commondir, linked: isLinkedWorktree(dirs), cache };
+    const plainFs = repoFs(dir, null, dirs);
     const cfg = readEolConfig(dir);
     const rules = loadAttributes(dir);
-    if (!needsEol(cfg, rules)) return { dir, cache, fs: repoFs(dir, null), eol: null };
+    if (!needsEol(cfg, rules)) return { ...base, fs: plainFs, eol: null };
     let index = new Map<string, string>();
     const loadIndex = async () => {
       const map = new Map<string, string>();
       try {
         await git.walk({
-          fs, dir, cache, trees: [git.STAGE()],
+          fs: plainFs, dir, cache, trees: [git.STAGE()],
           map: async (p, [e]) => { if (e && p !== '.' && (await e.type()) === 'blob') map.set(p, (await e.oid()) as string); return true; },
         });
       } catch { /* index 가 없으면 빈 목록 */ }
@@ -150,9 +144,9 @@ export function createGitService(opts: GitServiceOptions) {
       // isomorphic-git 은 index 잠금을 쥔 채 작업 폴더 파일을 읽으므로, 여기서 index 를 다시 읽으면 잠금이 걸린다 → 작업 전에 미리 읽어 둔다
       preload: async () => { index = await loadIndex(); },
       indexOid: async (rel) => index.get(rel),
-      readBlob: async (oid) => { try { return (await git.readBlob({ fs, dir, oid, cache })).blob; } catch { return null; } },
+      readBlob: async (oid) => { try { return (await git.readBlob({ fs: plainFs, dir, oid, cache })).blob; } catch { return null; } },
     };
-    return { dir, cache, fs: repoFs(dir, eol), eol };
+    return { ...base, fs: repoFs(dir, eol, dirs), eol };
   }
   async function needRepo(): Promise<Repo> {
     if (!opts.getRoot()) throw new GitError(400, 'no project is open', 'NO_PROJECT');
@@ -227,8 +221,8 @@ export function createGitService(opts: GitServiceOptions) {
     throw new GitError(404, `unknown ref: ${ref}`);
   }
 
-  // ---------- 병합 상태 (.git/MERGE_HEAD, MERGE_MSG, <NAME>_CONFLICTS) ----------
-  const gp = (r: Repo, n: string) => path.join(r.dir, '.git', n);
+  // ---------- 병합 상태 (<gitdir>/MERGE_HEAD, MERGE_MSG, <NAME>_CONFLICTS: 작업 트리마다 따로) ----------
+  const gp = (r: Repo, n: string) => path.join(r.gitdir, n);
   const mergeHead = (r: Repo): string | null => {
     try { return fs.readFileSync(gp(r, 'MERGE_HEAD'), 'utf8').trim() || null; } catch { return null; }
   };
@@ -297,11 +291,6 @@ export function createGitService(opts: GitServiceOptions) {
   }
 
   async function status(r0?: Repo | null): Promise<GitStatus> {
-    if (r0 === undefined) {
-      // 화면이 계속 부르는 조회이므로 오류 대신 '저장소 아님 + 이유' 로 답한다 (잘못된 상태를 보여 주지 않는다)
-      const dir = findDir();
-      if (dir && linkedWorktree(dir)) return { isRepo: false, repoRoot: norm(dir), branch: null, head: null, ahead: null, behind: null, merging: false, files: [], unsupported: 'worktree' };
-    }
     const r = r0 === undefined ? await findRepo() : r0;
     if (!r) return { isRepo: false, repoRoot: null, branch: null, head: null, ahead: null, behind: null, merging: false, files: [] };
     const head = await headOid(r);
@@ -1016,12 +1005,14 @@ export function createGitService(opts: GitServiceOptions) {
   const NETWORK = new Set(['clone', 'fetch', 'pull', 'push']);
   const laneOf = (op: string): Lane | null => (UNLIMITED.has(op) ? null : NETWORK.has(op) ? 'network' : 'local');
 
+  // 연결된 작업 트리에서 할 수 있는 작업 (읽기)
+  const WORKTREE_OK = new Set(['auth', 'forget-auth', 'status', 'show', 'log', 'changes', 'branches', 'remotes', 'identity', 'stash-list', 'tags', 'blame']);
+
   async function exec(op: string, fn: (b: Obj) => Promise<unknown>, body: Obj): Promise<unknown> {
     try {
-      if (op !== 'clone' && !UNLIMITED.has(op)) {
-        const dir = findDir();
-        if (dir) guardPacks(dir);
-      }
+      const dir = op === 'clone' ? null : findDir();
+      if (dir && !WORKTREE_OK.has(op) && isLinkedWorktree(gitDirs(dir))) throw unsupportedWorktree(dir);
+      if (dir && !UNLIMITED.has(op)) guardPacks(dir);
       if (MUTATING.has(op)) {
         const r = await findRepo();
         return await locked(r ? r.dir : '', () => fn(body));
