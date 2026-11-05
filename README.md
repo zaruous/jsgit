@@ -255,7 +255,7 @@ const gitHandler = createSingleRepoHandler({ getRoot, appName: 'exbe', ...env.op
 - **status 합치기는 큐에 넣기 전에**: 같은 저장소의 status 는 대기 중이든 실행 중이든 하나로 합쳐 결과를 같이 쓴다 (창 포커스·파일 저장·F5 마다 호출되어 쌓이는 것을 막는다). 합쳐진 요청이 모두 끊겨야 건너뛴다.
 - **끊긴 요청은 건너뛴다**: 차례가 왔을 때 `signal.aborted` 면 실행하지 않고 499 `ABORTED`. 비교 화면에서 파일을 빠르게 연달아 클릭할 때 쌓이는 show 를 줄인다.
 - **대기 중 표시**: `opId` 가 있으면 기다리는 동안 `{ phase: '대기 중', loaded: <순번> }` 을 (순번이 바뀔 때마다) 보내고, 시작하면 `{ phase: '실행 중' }`. 끊겨서 건너뛰면 `error` 로 끝낸다.
-- **pack 크기 상한**: 객체를 읽는 작업 앞에서 `.git/objects/pack/*.pack` 크기를 `stat` 으로만 본다(pack 폴더의 수정 시각이 같으면 다시 훑지 않는다). 하나라도 `maxPackBytes` 를 넘으면 서버 전체가 메모리 부족으로 죽는 대신 413 `PACK_TOO_LARGE` 와 "시스템 git CLI 를 쓰라"는 메시지로 거절한다. clone 은 대상이 비어 있으므로 검사하지 않는다.
+- **pack 크기 상한**: 객체를 읽는 작업 앞에서 `objects/pack/*.pack` 크기를 `stat` 으로만 본다(pack 폴더의 수정 시각이 같으면 다시 훑지 않는다). pack 폴더는 `.git` 이 파일이면 `gitdir:` 를, 그 gitdir 에 `commondir` 이 있으면 공통 폴더를 따라 찾고(`--separate-git-dir`, 하위 모듈, 연결된 작업 트리), `objects/info/alternates` 가 가리키는 객체 폴더의 pack 도 본다 ([#2](https://github.com/zaruous/jsgit/issues/2)). 하나라도 `maxPackBytes` 를 넘으면 서버 전체가 메모리 부족으로 죽는 대신 413 `PACK_TOO_LARGE` 와 "시스템 git CLI 를 쓰라"는 메시지로 거절한다. clone 은 대상이 비어 있으므로 검사하지 않는다.
 - **show 크기 상한**: HEAD·index·ref 쪽도 `maxShowBytes` 를 넘으면 413 `TOO_LARGE`. isomorphic-git 은 blob 크기를 읽기 전에 알려 주지 않아 읽은 뒤에 확인한다. 큰 내용이 응답 JSON 에 들어가지 않는 것을 보장한다. 작업 폴더 쪽은 예전처럼 `stat` 으로 먼저 보고 `{ text: null, binary: true }` 를 돌려준다.
 
 #### 하지 않은 것과 이유
@@ -282,7 +282,7 @@ npm test                 # vitest run 전체 (약 4분)
 npx vitest run <파일>     # 하나만
 ```
 
-- 테스트는 소스 옆에 있다: `src/server/service.test.ts`(서비스 전체, 로컬 HTTP 원격 포함), `eol.test.ts`(줄 끝 변환), `limiter.test.ts`(제한기·크기 상한), `worktree.test.ts`(연결된 작업 트리 거절), `src/client/*.test.ts`(UI 로직).
+- 테스트는 소스 옆에 있다: `src/server/service.test.ts`(서비스 전체, 로컬 HTTP 원격 포함), `eol.test.ts`(줄 끝 변환), `limiter.test.ts`(제한기·크기 상한), `gitdir.test.ts`(`.git` 파일 저장소·alternates 의 pack 상한), `worktree.test.ts`(연결된 작업 트리 거절), `src/client/*.test.ts`(UI 로직).
 - 테스트는 이 PC 의 시스템·사용자 git 설정(예: Windows 용 Git 의 `core.autocrlf=true`)과 무관하게 돌도록 `GIT_CONFIG_NOSYSTEM=1` 과 존재하지 않는 `GIT_CONFIG_GLOBAL` 을 테스트 파일 맨 위에서 설정한다. 새 테스트 파일도 같게 한다. `limiter.test.ts` 는 작은 pack 을 만들려고 시스템 `git repack` 을, `worktree.test.ts` 는 작업 트리를 만들려고 `git worktree add` 를 쓰므로 git 이 PATH 에 있어야 한다 (`worktree.test.ts` 는 없으면 건너뛴다).
 - 큰 파일을 만들지 않는다. 크기 관련 동작은 `maxPackBytes`, `maxShowBytes`, `concurrency` 같은 값을 줄여서 검증한다.
 - 코드 주석은 이 코드베이스의 평이한 한국어 문체를 따른다.

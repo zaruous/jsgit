@@ -9,6 +9,7 @@ import type {
 } from '../types.ts';
 import { matchLines } from './diff.ts';
 import { repoFs, loadAttributes, needsEol, readEolConfig, toRepo, type EolContext } from './eol.ts';
+import { gitDirs, packDirs } from './gitdir.ts';
 import { ProgressHub } from './progress.ts';
 import { setWorkConcurrency, workLimiter, type Lane } from './limiter.ts';
 import {
@@ -160,26 +161,32 @@ export function createGitService(opts: GitServiceOptions) {
     return r;
   }
 
-  /** 읽을 pack 이 너무 크면 거절한다 (stat 만 본다). isomorphic-git 은 pack 전체를 메모리에 올린다 */
+  /**
+   * 읽을 pack 이 너무 크면 거절한다 (stat 만 본다). isomorphic-git 은 pack 전체를 메모리에 올린다.
+   * pack 폴더는 .git 파일(gitdir:)·commondir·objects/info/alternates 를 따라 찾는다 (jsgit#2). 캐시 키는 실제 pack 폴더 경로
+   */
   function guardPacks(dir: string): void {
-    const pd = path.join(dir, '.git', 'objects', 'pack');
-    let mtimeMs: number;
-    try { mtimeMs = fs.statSync(pd).mtimeMs; } catch { return; }
-    let c = packCache.get(pd);
-    if (!c || c.mtimeMs !== mtimeMs) {
-      c = { mtimeMs, max: 0, name: '' };
-      for (const n of fs.readdirSync(pd)) {
-        if (!n.endsWith('.pack')) continue;
-        try {
-          const size = fs.statSync(path.join(pd, n)).size;
-          if (size > c.max) { c.max = size; c.name = n; }
-        } catch { /* 사라진 파일은 무시 */ }
+    const d = gitDirs(dir);
+    if (!d) return;
+    for (const pd of packDirs(d.commondir)) {
+      let mtimeMs: number;
+      try { mtimeMs = fs.statSync(pd).mtimeMs; } catch { continue; }
+      let c = packCache.get(pd);
+      if (!c || c.mtimeMs !== mtimeMs) {
+        c = { mtimeMs, max: 0, name: '' };
+        for (const n of fs.readdirSync(pd)) {
+          if (!n.endsWith('.pack')) continue;
+          try {
+            const size = fs.statSync(path.join(pd, n)).size;
+            if (size > c.max) { c.max = size; c.name = n; }
+          } catch { /* 사라진 파일은 무시 */ }
+        }
+        packCache.set(pd, c);
       }
-      packCache.set(pd, c);
-    }
-    if (c.max > maxPack) {
-      const mb = (n: number) => Math.round(n / 1024 / 1024);
-      throw new GitError(413, `pack file is too large for this server (${c.name}, ${mb(c.max)}MB > limit ${mb(maxPack)}MB); use the system git CLI for this repository`, 'PACK_TOO_LARGE', { pack: c.name, bytes: c.max, limit: maxPack });
+      if (c.max > maxPack) {
+        const mb = (n: number) => Math.round(n / 1024 / 1024);
+        throw new GitError(413, `pack file is too large for this server (${c.name}, ${mb(c.max)}MB > limit ${mb(maxPack)}MB); use the system git CLI for this repository`, 'PACK_TOO_LARGE', { pack: c.name, bytes: c.max, limit: maxPack });
+      }
     }
   }
 
