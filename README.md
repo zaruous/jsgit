@@ -211,7 +211,7 @@ const gitHandler = createSingleRepoHandler({ getRoot, appName: 'exbe', ...env.op
 | 400 | `NO_IDENTITY` | `user.name`/`user.email` 이 없음 |
 | 400 | `NO_PROJECT` | 열린 프로젝트가 없거나 `project` 가 잘못됨 |
 | 400 | `NOT_REPO` | git 저장소가 아님 |
-| 409 | `UNSUPPORTED_WORKTREE` | 연결된 작업 트리(`git worktree add` 로 만든 폴더)에서 아직 지원하지 않는 작업. 읽기(status, show, log, changes, branches, remotes, identity, stash-list, tags, blame)는 지원한다 ([#3](https://github.com/zaruous/jsgit/issues/3)) |
+| 409 | `BRANCH_IN_WORKTREE` | 다른 작업 트리(주 작업 트리 포함)가 꺼내 둔 브랜치를 `checkout` 하거나 `branch-delete` 하려 함 (git 과 같은 규칙). `branch`, `worktree` |
 | 413 | `TOO_LARGE` | `show` 대상이 `maxShowBytes` 초과. `size`, `limit` |
 | 413 | `PACK_TOO_LARGE` | pack 이 `maxPackBytes` 초과. `pack`, `bytes`, `limit` |
 | 499 | `ABORTED` | 요청 연결이 끊겨 실행하지 않음 |
@@ -270,7 +270,7 @@ const gitHandler = createSingleRepoHandler({ getRoot, appName: 'exbe', ...env.op
 - fetch/pull 은 받은 pack 전체를 모은 뒤 한 번 더 복사하고, push 는 보낼 pack 을 통째로 만든 뒤 HTTP 클라이언트가 한 번 더 모은다. 이쪽에는 크기 상한이 없고, network 작업이 local 작업과 겹치면 최고치가 합쳐진다.
 - `show` 의 크기 확인은 blob 을 읽은 뒤에 한다. `blame`·줄 끝 변환 등의 blob 읽기에는 별도 상한이 없다.
 - pack 크기 검사는 pack 폴더의 `mtime` 에 기대므로, 수정 시각이 안 바뀌는 방식으로 pack 이 교체되면 오래된 값을 볼 수 있다. 상한 초과 여부만 보는 안전장치이고 정확한 계량이 아니다.
-- 연결된 작업 트리(`.git` 이 파일이고 그 gitdir 에 `commondir` 이 있음): isomorphic-git 은 commondir 을 모르므로 jsgit 의 fs 래퍼(`repoFs`)가 git 의 [gitrepository-layout](https://git-scm.com/docs/gitrepository-layout) 규칙대로 경로를 나눈다. `HEAD`, `index`, `ORIG_HEAD`, `MERGE_*`, `FETCH_HEAD`, `logs/HEAD`, `refs/bisect`, `refs/worktree`, `<NAME>_CONFLICTS` 는 작업 트리 gitdir 에, `objects`, `refs`, `packed-refs`, `config`, `info`, `hooks`, `logs/refs` 는 공통 폴더에서 읽고 쓴다 ([#3](https://github.com/zaruous/jsgit/issues/3)). 줄 끝 설정(`config`, `info/attributes`)도 공통 폴더 것을 본다. `--separate-git-dir`·하위 모듈처럼 `commondir` 이 없는 `.git` 파일은 그대로 쓴다. isomorphic-git 은 `objects/info/alternates` 를 따르지 않으므로 `clone --shared` 저장소는 읽지 못한다(pack 크기 검사는 alternates 도 본다).
+- 연결된 작업 트리(`.git` 이 파일이고 그 gitdir 에 `commondir` 이 있음): isomorphic-git 은 commondir 을 모르므로 jsgit 의 fs 래퍼(`repoFs`)가 git 의 [gitrepository-layout](https://git-scm.com/docs/gitrepository-layout) 규칙대로 경로를 나눈다. `HEAD`, `index`, `ORIG_HEAD`, `MERGE_*`, `FETCH_HEAD`, `logs/HEAD`, `refs/bisect`, `refs/worktree`, `<NAME>_CONFLICTS` 는 작업 트리 gitdir 에, `objects`, `refs`, `packed-refs`, `config`, `info`, `hooks`, `logs/refs` 는 공통 폴더에서 읽고 쓴다 ([#3](https://github.com/zaruous/jsgit/issues/3)). 줄 끝 설정(`config`, `info/attributes`)도 공통 폴더 것을 본다. 읽기·쓰기 작업 모두 지원하며, git 처럼 한 브랜치는 한 작업 트리에서만 꺼낼 수 있고(`409 BRANCH_IN_WORKTREE`), 다른 작업 트리가 꺼낸 브랜치의 이름을 바꾸면 그 작업 트리의 HEAD 도 옮긴다. `refs/stash` 는 공유 ref 라 모든 작업 트리에서 같은 stash 목록이 보인다(git 과 같다). isomorphic-git 이 stash reflog 를 git 이 읽지 못하는 형식(`name email`)으로 쓰므로 `stash-push` 뒤 `name <email>` 형식으로 고쳐 쓴다. `--separate-git-dir`·하위 모듈처럼 `commondir` 이 없는 `.git` 파일은 그대로 쓴다. isomorphic-git 은 `objects/info/alternates` 를 따르지 않으므로 `clone --shared` 저장소는 읽지 못한다(pack 크기 검사는 alternates 도 본다).
 - 제한기는 프로세스 하나 안에서만 유효하다. 서버를 여러 프로세스로 띄우면 프로세스마다 따로 제한한다.
 
 ## 개발
